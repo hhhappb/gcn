@@ -1,0 +1,99 @@
+# --- 主工作目录 ---
+work_dir: ./work_dir/shrec17_sdtgru_maxlen150 # <<<--- 修改目录名，反映 max_len 变化
+
+# --- 指定要融合训练的模态 ---
+modalities: ['joint'] # <<<--- 保持单模态 'joint'
+base_channel: 3
+
+# --- 测试集标签文件 ---
+label_file: 'data/shrec/shrec17_jsons/test_samples.json'
+
+# --- 数据加载器配置 ---
+feeder: feeders.feeder_shrec17.Feeder
+train_feeder_args:
+  root_dir: 'data/shrec/shrec17_jsons'
+  list_file: 'data/shrec/shrec17_jsons/train_samples.json'
+  split: 'train'
+  label_type: 'label_28'
+  max_len: 140                         # <<<--- 修改此处: 180 -> 150
+  data_path: 'joint'
+  repeat: 5
+  random_choose: true
+  apply_random_translation: true
+  num_classes: 28                      # <<<--- 确保类别数正确
+test_feeder_args:
+  root_dir: 'data/shrec/shrec17_jsons'
+  list_file: 'data/shrec/shrec17_jsons/test_samples.json'
+  split: 'val'
+  label_type: 'label_28'
+  max_len: 140                         # <<<--- 修改此处: 180 -> 150
+  data_path: 'joint'
+  repeat: 1
+  random_choose: false
+  apply_random_translation: false
+  num_classes: 28                      # <<<--- 确保类别数正确
+
+# --- 模型配置 (使用 SDT-GRU) ---
+model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier
+model_args:
+  # num_input_dim: 3 # 由 main.py 计算
+  num_nodes: 22
+  num_classes: 28
+  max_seq_len: 140    # <<<--- 修改此处: 180 -> 150
+  # --- 其他 SDT-GRU 参数 (保持你之前的设置) ---
+  num_rnn_layers: 2
+  num_rnn_units: 128
+  n_heads: 8
+  ffn_dim: 256
+  st_layers: 2
+  st_dropout_rate: 0.15
+  rnn_dropout_rate: 0.15
+  classifier_dropout: 0.4
+  use_temporal_attn: true
+  num_temporal_layers: 1
+  temporal_n_heads: 8
+  temporal_ffn_dim: 512
+  temporal_dropout_rate: 0.15
+  use_gap: true
+  classifier_hidden_dim: 64
+  use_conv_proj: true
+  conv_kernel_size: 3
+  qkv_bias: false
+  output_attention: false
+
+# --- 优化器与学习率 (保持你之前的设置) ---
+optimizer: AdamW
+base_lr: 0.001
+weight_decay: 0.05
+
+# --- 学习率调度器 ---
+lr_scheduler: multistep
+step: [40, 60]
+lr_decay_rate: 0.1
+warm_up_epoch: 10
+
+# --- 训练与测试流程配置 ---
+batch_size: 64            # <<<--- 保持之前的 batch_size
+test_batch_size: 128      # <<<--- 保持之前的 test_batch_size
+num_epoch: 80
+num_worker: 16
+loss_type: SmoothCE
+
+# --- 梯度裁剪 ---
+grad_clip: false
+
+# --- 日志与保存 ---
+log_interval: 50
+eval_interval: 1
+save_interval: 0
+save_epoch: 0
+print_log: true
+save_score: true
+show_topk: [1]
+
+# --- 早停 ---
+early_stop_patience: 20
+
+# --- 设备和种子 ---
+device: [0]
+seed: 1

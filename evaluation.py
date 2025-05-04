@@ -6,6 +6,9 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import os
+import logging
+logger = logging.getLogger(__name__)
 
 # --- 导入你的新模型和数据加载器 ---
 from model.SDT_GRUs_Gesture import SDT_GRU_Classifier
