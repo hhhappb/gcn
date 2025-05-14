@@ -244,16 +244,42 @@ if __name__ == '__main__':
     print(f"基础通道数: {base_channel}, 融合模态数: {len(modalities_to_fuse)}")
     print(f"模型期望的总输入维度 (num_input_dim) 已设置为: {fused_arg.model_args['num_input_dim']}")
 
-    # 2. 动态生成并强制设置 feeder_args 中的 data_path (对于早期融合是必须的)
-    combined_data_path = ','.join(modalities_to_fuse)
+    # 2. 为 feeder_args 设置正确的 'modalities' 参数，但不覆盖文件路径 'data_path'
+    #    同时，确保 feeder_args 中有 base_channel (如果 feeder 需要它)
+
+    # modalities_to_fuse 是在之前定义的，例如 ['joint'] 或 ['joint', 'bone']
+    # combined_data_path = ','.join(modalities_to_fuse) # 这个变量不再用于直接覆盖文件路径
+
     for fe_args_attr_name in ['train_feeder_args', 'test_feeder_args']:
-        fe_args = getattr(fused_arg, fe_args_attr_name)
-        if fe_args.get('data_path') != combined_data_path:
-            print(f"信息: {fe_args_attr_name}.data_path (原值: '{fe_args.get('data_path')}') "
-                  f"将被根据 modalities 计算的值 ('{combined_data_path}') 强制设置。")
-        fe_args['data_path'] = combined_data_path
-        # 确保 feeder_args 中也有 base_channel，如果 feeder 需要它来内部计算
-        if 'base_channel' not in fe_args : fe_args['base_channel'] = base_channel
+        fe_args = getattr(fused_arg, fe_args_attr_name) # 获取 train_feeder_args 或 test_feeder_args 字典
+
+        # 步骤 2.1: 保留 YAML 中为 data_path 设置的原始文件路径。
+        # 我们不再用模态名称字符串覆盖它。
+        # 因此，之前用于覆盖 data_path 的代码被移除或注释。
+        # 之前的覆盖逻辑:
+        # if fe_args.get('data_path') != combined_data_path: 
+        #     print(f"信息: {fe_args_attr_name}.data_path (原值: '{fe_args.get('data_path')}') "
+        #           f"将被根据 modalities 计算的值 ('{combined_data_path}') 强制设置。")
+        # fe_args['data_path'] = combined_data_path  # <<--- 这行被移除了
+
+        # 步骤 2.2: 确保 Feeder 知道要加载哪些模态。
+        # fused_arg.modalities 是顶层命令行/YAML中指定的、当前实验要融合的模态列表。
+        # 我们将这个列表转换成逗号分隔的字符串，并设置/覆盖 feeder_args 的 'modalities' 键。
+        # 这样 Feeder 就可以根据这个 'modalities' 参数来决定加载和处理哪些数据流。
+        modalities_str_for_feeder = ','.join(modalities_to_fuse) # 例如 "joint" 或 "joint,bone"
+        
+        # 只有当 feeder_args 中原有的 modalities 与程序决定的不同时才打印信息，避免冗余日志
+        if fe_args.get('modalities') != modalities_str_for_feeder:
+            print(f"信息: {fe_args_attr_name}.modalities (原值: '{fe_args.get('modalities')}') "
+                  f"将设置为程序融合的模态 ('{modalities_str_for_feeder}')。")
+        fe_args['modalities'] = modalities_str_for_feeder
+        
+        # 步骤 2.3: 确保 feeder_args 中也有 base_channel，如果 feeder 内部需要它。
+        # base_channel 是在前面从 fused_arg.base_channel 获取的。
+        if 'base_channel' not in fe_args: 
+            fe_args['base_channel'] = base_channel
+            # 可以选择性地打印这个信息，如果需要追踪 base_channel 的来源
+            # print(f"信息: 为 {fe_args_attr_name} 添加 base_channel: {base_channel}")
 
 
     # 3. 同步 num_classes (以 model_args 为准)
