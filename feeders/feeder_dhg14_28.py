@@ -1,4 +1,4 @@
-# 文件名: feeders/feeder_dhg14_28.py (适配 SDT-GRU 模型)
+v# 文件名: feeders/feeder_dhg14_28.py (v2.0 - 完全修正LOSO加载逻辑)
 
 import json
 import os
@@ -10,51 +10,42 @@ import pickle
 import logging
 import torch
 from torch.utils.data import Dataset
-import glob # 导入 glob
+import glob
 from tqdm import tqdm
+import re
+import traceback
 
+# --- 日志记录器设置 ---
 logger = logging.getLogger(__name__)
+# 如果直接运行此文件进行测试，则需要配置 basicConfig
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, # <--- 可以设为 DEBUG 看更详细信息
+                        format='%(asctime)s - %(levelname)-8s - %(name)s - %(message)s')
 
-# --- 辅助函数：填充/截断序列并生成掩码 ---
+# --- 辅助函数：pad_sequence_with_mask (保持不变) ---
 def pad_sequence_with_mask(seq, max_len, num_nodes, num_channels, pad_value=0.0):
-    """将序列填充/截断到指定长度，并返回序列和掩码"""
     if seq is None or seq.size == 0:
         padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
         mask = np.zeros(max_len, dtype=bool)
         return padded_seq, mask
-
     seq_len = seq.shape[0]
-
     if seq_len == 0:
         padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
         mask = np.zeros(max_len, dtype=bool)
         return padded_seq, mask
-
-    # 检查输入维度是否基本正确 (T, N, C_base or C_total)
-    if seq.ndim < 3 or seq.shape[1] != num_nodes:
+    if seq.ndim != 3 or seq.shape[1] != num_nodes:
          logger.warning(f"Pad input seq shape {seq.shape} mismatch expected node count {num_nodes}. Returning zeros.")
          padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
          mask = np.zeros(max_len, dtype=bool)
          return padded_seq, mask
-    # 允许通道数是 C_base 或 C_total (拼接后)
     current_channels = seq.shape[2]
     if current_channels != num_channels:
-        logger.warning(f"Pad input seq channel {current_channels} mismatch expected {num_channels}. Padding/truncating channels if possible or returning zeros.")
-        # 尝试处理通道不匹配，简单填充/截断 (或者报错)
-        if current_channels < num_channels:
-            padding_channels = np.full((seq_len, num_nodes, num_channels - current_channels), pad_value, dtype=seq.dtype)
-            seq = np.concatenate([seq, padding_channels], axis=-1)
-        else:
-            seq = seq[..., :num_channels]
-        # 如果无法处理，还是返回零吧
-        # padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
-        # mask = np.zeros(max_len, dtype=bool)
-        # return padded_seq, mask
-
-
+        logger.warning(f"Pad input seq channel {current_channels} mismatch expected total channels {num_channels}. Returning zeros.")
+        padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
+        mask = np.zeros(max_len, dtype=bool)
+        return padded_seq, mask
     if seq_len < max_len:
         pad_len = max_len - seq_len
-        # 使用正确的通道数创建 padding
         padding = np.full((pad_len, num_nodes, num_channels), pad_value, dtype=seq.dtype)
         padded_seq = np.concatenate([seq, padding], axis=0)
         mask = np.concatenate([np.ones(seq_len, dtype=bool), np.zeros(pad_len, dtype=bool)], axis=0)
@@ -64,56 +55,57 @@ def pad_sequence_with_mask(seq, max_len, num_nodes, num_channels, pad_value=0.0)
     else:
         padded_seq = seq
         mask = np.ones(max_len, dtype=bool)
-
     return padded_seq, mask
+
 
 class Feeder(Dataset):
     """
-    用于 DHG14-28 数据集的 Feeder 类 (适配 SDT-GRU 模型)。
-    支持留一交叉验证 (LOSO) 结构。
+    用于 DHG14-28 数据集的 Feeder 类 (v2.0 - 完全修正 LOSO 加载逻辑)。
+    从每个 subject 的文件夹读取对应的 samples.json 列表，
+    并根据列表内容加载该 subject 下 train/val 子目录中的数据文件。
     """
-    def __init__(self, root_dir, subject_idx, split, # <<<--- 使用 subject_idx
+    def __init__(self, root_dir, subject_idx, split,
                  label_type='label_28',
                  max_len=150,
                  data_path='joint',
                  base_channel=3,
                  repeat=1,
                  random_choose=False,
-                 # --- 通用增强参数 ---
-                 apply_rand_view_transform=True, # 旋转缩放
-                 apply_random_shear=False, shear_amplitude=0.5, # 剪切
-                 apply_random_flip=False, # <<<--- DHG 默认关闭翻转
+                 apply_rand_view_transform=True,
+                 apply_random_shear=False, shear_amplitude=0.5,
+                 apply_random_flip=False,
                  apply_coord_drop=False, coord_drop_prob=0.1, coord_drop_axis=None,
                  apply_joint_drop=False, joint_drop_prob=0.1,
-                 center_joint_idx=0, # <<<--- DHG 中心点索引，默认为 0 (需确认)
+                 center_joint_idx=0,
                  debug=False,
-                 **kwargs): # 接收 num_classes 等其他参数
+                 **kwargs):
 
         super().__init__()
 
-        # 参数校验
+        # --- 参数校验和基础设置 ---
         if not os.path.isdir(root_dir): raise ValueError(f"无效的数据集根目录: {root_dir}")
         if split not in ['train', 'val', 'test']: raise ValueError(f"无效的 split: {split}")
         if not (1 <= subject_idx <= 20): raise ValueError(f"无效的 subject_idx: {subject_idx}, 应在 1 到 20 之间")
 
-        self.root_dir = root_dir
-        self.subject_idx = subject_idx
-        self.split = split
-        self.train_val = 'train' if split == 'train' else 'val'
+        self.root_dir = root_dir # 指向 DHG14-28_sample_json 目录
+        self.subject_idx_eval = subject_idx # 验证/测试时使用的 subject ID
+        self.split = split # 'train', 'val', or 'test'
         self.label_type = label_type
         self.max_len = max_len
-        self.repeat = repeat if self.train_val == 'train' else 1
-        self.random_choose = random_choose if self.train_val == 'train' else False
-        self.center_joint_idx = center_joint_idx # 可以为 None 来禁用中心化
+        self.repeat = repeat if self.split == 'train' else 1
+        self.random_choose = random_choose if self.split == 'train' else False
+        if center_joint_idx is not None and not (0 <= center_joint_idx < 22):
+            logger.warning(f"提供的 center_joint_idx ({center_joint_idx}) 无效，将禁用中心化。")
+            self.center_joint_idx = None
+        else:
+            self.center_joint_idx = center_joint_idx
         self.debug = debug
 
-        # --- DHG14-28 特定参数 ---
+        # --- DHG 特定参数 ---
         self.num_nodes = 22
         self.base_channel = base_channel
-        # 骨骼连接 (0-based)
         self.bone_pairs = [(0, 1), (2, 0), (3, 2), (4, 3), (5, 4), (6, 1), (7, 6), (8, 7), (9, 8), (10, 1), (11, 10),
                            (12, 11), (13, 12), (14, 1), (15, 14), (16, 15), (17, 16), (18, 1), (19, 18), (20, 19), (21, 20)]
-        # 左右手对应关节点 (需要根据 DHG 定义更新，但默认不使用翻转)
         self.left_parts = []
         self.right_parts = []
 
@@ -128,162 +120,228 @@ class Feeder(Dataset):
         self.num_input_dim = self.base_channel * len(self.modalities)
 
         # --- 保存增强参数 ---
-        self.apply_rand_view_transform = apply_rand_view_transform if self.train_val == 'train' else False
-        self.apply_random_shear = apply_random_shear if self.train_val == 'train' else False
+        self.apply_rand_view_transform = apply_rand_view_transform if self.split == 'train' else False
+        self.apply_random_shear = apply_random_shear if self.split == 'train' else False
         self.shear_amplitude = shear_amplitude
-        self.apply_random_flip = apply_random_flip if self.train_val == 'train' else False
-        self.apply_coord_drop = apply_coord_drop if self.train_val == 'train' else False
+        self.apply_random_flip = apply_random_flip if self.split == 'train' else False
+        self.apply_coord_drop = apply_coord_drop if self.split == 'train' else False
         self.coord_drop_prob = coord_drop_prob
         self.coord_drop_axis = coord_drop_axis
-        self.apply_joint_drop = apply_joint_drop if self.train_val == 'train' else False
+        self.apply_joint_drop = apply_joint_drop if self.split == 'train' else False
         self.joint_drop_prob = joint_drop_prob
 
-        logger.info(f"初始化 Feeder for DHG14-28 (Subject {subject_idx} as {split}): root={root_dir}")
-        logger.info(f"标签类型: {label_type}, 目标序列长度: {max_len}")
+        # --- 打印初始化信息 ---
+        split_desc = f"TRAINING (leaving Subject {self.subject_idx_eval} out)" if self.split == 'train' else f"VALIDATION/TESTING on Subject {self.subject_idx_eval}"
+        logger.info(f"初始化 Feeder for DHG14-28 ({split_desc}): root={self.root_dir}")
+        logger.info(f"标签类型: {self.label_type}, 目标序列长度: {max_len}")
         logger.info(f"加载模态: {self.modalities}, 总输入维度: {self.num_input_dim}")
-        if self.train_val == 'train':
+        if self.center_joint_idx is not None: logger.info(f"中心化关节索引: {self.center_joint_idx}")
+        else: logger.info("中心化已禁用。")
+        if self.split == 'train':
             logger.info(f"训练时增强: RandViewTransform={self.apply_rand_view_transform}, RandShear={self.apply_random_shear}, RandFlip={self.apply_random_flip}, CoordDrop={self.apply_coord_drop}, JointDrop={self.apply_joint_drop}")
+        if self.apply_random_flip:
+             logger.warning("!!! RandomFlip 已启用，但 DHG 的左右映射 (left/right_parts) 未定义，可能效果不佳或无效 !!!")
 
         # --- 加载数据 ---
-        self.sample_info = [] # 存储 {'id': ...}
+        self.sample_info = [] # 存储 {'id': sample_id_base, 'path': json_path}
         self.label = []       # 存储 0-based 标签
-        self.data = {}        # 字典存储数据，键为 sample_id
+        self.data = []        # 列表存储加载的 numpy 数据
 
-        self._load_data_loso()
+        self._load_data_loso_corrected() # <<<--- 调用修正后的加载函数 v2.0
 
-        # 过滤无效样本并转换为列表
-        valid_indices = [i for i, info in enumerate(self.sample_info) if info['id'] in self.data and self.data[info['id']] is not None and self.label[i] != -1]
-        self.sample_info = [self.sample_info[i] for i in valid_indices]
-        self.label = [self.label[i] for i in valid_indices]
-        self.data = [self.data[info['id']] for info in self.sample_info] # 转为列表
-
-        if not self.sample_info: raise RuntimeError(f"未能加载任何有效的样本信息 for split '{split}' (subject {subject_idx})")
+        # --- 加载后检查 ---
+        if not self.sample_info: raise RuntimeError(f"未能加载任何有效的样本信息 for split '{split}' (Subject {self.subject_idx_eval} {'out' if split=='train' else 'as test'})")
         if len(self.sample_info) != len(self.label) or len(self.sample_info) != len(self.data):
-             raise RuntimeError(f"样本信息、标签、数据数量不匹配！ Split: {split}, Subject: {subject_idx}")
+             raise RuntimeError(f"样本信息 ({len(self.sample_info)}), 标签 ({len(self.label)}), 数据 ({len(self.data)}) 数量不匹配！ Split: {split}, Subject: {self.subject_idx_eval}")
 
-        # 推断类别数
-        self.num_classes = kwargs.get('num_classes', 0) # 尝试从 kwargs 获取
+        # --- 推断类别数 ---
+        self.num_classes = kwargs.get('num_classes', 0)
         if self.num_classes == 0 and self.label:
-            self.num_classes = max(self.label) + 1
+            valid_labels = [l for l in self.label if l != -1]
+            if valid_labels: self.num_classes = max(valid_labels) + 1
         if self.num_classes == 0:
-             # 尝试从 label_type 推断
              self.num_classes = 14 if '14' in self.label_type else 28
              logger.warning(f"无法从标签列表推断类别数，根据 label_type 猜测为 {self.num_classes}")
         logger.info(f"使用的类别数: {self.num_classes}")
 
-
+        # --- Debug 模式截断 ---
         if self.debug:
-             limit = min(100, len(self.sample_info)); self.sample_info=self.sample_info[:limit]; self.label=self.label[:limit]; self.data=self.data[:limit]
+             limit = min(100, len(self.sample_info))
              logger.warning(f"!!! DEBUG 模式开启，只使用前 {limit} 个样本 !!!")
+             self.sample_info=self.sample_info[:limit]
+             self.label=self.label[:limit]
+             self.data=self.data[:limit]
 
-        logger.info(f"成功加载 {len(self.sample_info)} 个有效样本用于 '{split}' split (Subject {subject_idx} as {'validation' if split != 'train' else 'training'})。")
+        logger.info(f"成功加载 {len(self.sample_info)} 个有效样本用于 '{split}' split。")
 
 
-    def _load_data_loso(self):
-        """根据 LOSO 结构加载数据列表和数据"""
-        # 构造列表文件和数据目录路径
-        list_file_path = os.path.join(self.root_dir, str(self.subject_idx), f"{self.subject_idx}{self.train_val}_samples.json")
-        json_data_dir = os.path.join(self.root_dir, str(self.subject_idx), self.train_val)
-
-        if not os.path.exists(list_file_path): raise FileNotFoundError(f"找不到列表文件: {list_file_path}")
-        if not os.path.isdir(json_data_dir): raise FileNotFoundError(f"找不到 JSON 数据目录: {json_data_dir}")
-
-        logger.info(f"从 {list_file_path} 加载样本列表...")
-        try:
-            with open(list_file_path, 'r') as f:
-                sample_info_raw = json.load(f) # 先加载原始列表
-        except Exception as e:
-            logger.error(f"无法加载或解析列表文件 {list_file_path}: {e}"); raise e
-
-        logger.info(f"开始从 {json_data_dir} 加载骨骼数据...")
-        loaded_count = 0; skipped_label = 0; skipped_data = 0
-
-        # 临时列表存储有效信息
-        temp_sample_info = []
-        temp_label = []
-
-        for info in tqdm(sample_info_raw, desc=f"加载 S{self.subject_idx} {self.split} 数据"): # 添加进度条
-            sample_id = info.get('file_name')
-            if not sample_id: continue
-
-            # 处理标签
+    def _parse_subject_from_filename(self, filename):
+        """ 从 gXXfXXsXXeXX 格式的文件名中解析出 subject ID (整数) """
+        match = re.search(r's(\d+)', filename)
+        if match:
             try:
-                label_val = int(info[self.label_type])
-                if label_val <= 0: raise ValueError("标签需为正")
-                final_label = label_val - 1
-            except (KeyError, ValueError, TypeError):
-                 final_label = -1; skipped_label += 1
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None
 
-            # 读取对应的 JSON 数据文件
-            json_path = os.path.join(json_data_dir, sample_id + '.json')
-            data_numpy = self._read_dhg_json(json_path, sample_id)
+    def _load_data_loso_corrected(self):
+        """根据 LOSO 结构加载数据列表和数据 (v2.0 - 完全修正逻辑)"""
+        temp_sample_info = []
+        temp_label_list = []
+        temp_data_list = []
 
-            # 只有当数据和标签都有效时才加入
-            if data_numpy is not None and final_label != -1:
-                temp_sample_info.append({'id': sample_id}) # 简化存储
-                temp_label.append(final_label)
-                self.data[sample_id] = data_numpy # 仍然用字典临时存储
-                loaded_count += 1
-            else:
-                skipped_data += 1
-                if final_label != -1 and data_numpy is None: logger.debug(f"样本 {sample_id} 标签有效但数据加载失败。")
-                elif final_label == -1 and data_numpy is not None: logger.debug(f"样本 {sample_id} 数据有效但标签无效。")
-                # else: 两者都无效
+        # 确定要加载哪些 subject 的数据
+        if self.split == 'train':
+            subjects_to_load = [s for s in range(1, 21) if s != self.subject_idx_eval]
+            list_suffix = "train_samples.json"
+            data_subdir = "train"
+            logger.info(f"加载训练数据，使用 Subjects: {subjects_to_load}")
+        else: # 'val' or 'test'
+            subjects_to_load = [self.subject_idx_eval]
+            list_suffix = "val_samples.json"
+            data_subdir = "val"
+            logger.info(f"加载验证/测试数据，使用 Subject: {subjects_to_load}")
 
+        total_loaded_count = 0
+        total_skipped_label = 0
+        total_skipped_data = 0
+        total_invalid_label_value = 0
+
+        # 遍历需要加载的 subject
+        for current_subject_id in subjects_to_load:
+            subject_dir = os.path.join(self.root_dir, str(current_subject_id))
+            list_file_path = os.path.join(subject_dir, f"{current_subject_id}{list_suffix}")
+            json_data_dir = os.path.join(subject_dir, data_subdir)
+
+            # 检查列表文件和数据目录是否存在
+            if not os.path.exists(list_file_path):
+                logger.warning(f"List file not found for Subject {current_subject_id}: {list_file_path}, skipping this subject.")
+                continue
+            if not os.path.isdir(json_data_dir):
+                logger.warning(f"Data directory not found for Subject {current_subject_id}: {json_data_dir}, skipping this subject.")
+                continue
+
+            logger.debug(f"Processing Subject {current_subject_id}, List: {list_file_path}, Data Dir: {json_data_dir}")
+
+            # 加载当前 subject 的样本列表
+            try:
+                with open(list_file_path, 'r', encoding='utf-8') as f:
+                    sample_list_raw = json.load(f)
+            except Exception as e:
+                logger.warning(f"Cannot load/parse list file {list_file_path}: {e}, skipping this subject.")
+                continue
+
+            # 遍历当前 subject 的样本列表
+            subject_loaded_count = 0
+            subject_skipped_label = 0
+            subject_skipped_data = 0
+            subject_invalid_label = 0
+
+            for info in tqdm(sample_list_raw, desc=f"S{current_subject_id} {data_subdir}", leave=False):
+                sample_id_base = info.get('file_name')
+                if not sample_id_base:
+                    subject_skipped_data += 1 # 列表条目本身有问题
+                    continue
+
+                # 构造实际数据文件路径
+                json_path = os.path.join(json_data_dir, sample_id_base + '.json')
+
+                # 检查文件是否存在
+                if not os.path.exists(json_path):
+                    # logger.debug(f"JSON file not found for {sample_id_base} at: {json_path}")
+                    subject_skipped_data += 1
+                    continue
+
+                # 处理标签
+                final_label = -1
+                try:
+                    label_val = int(info[self.label_type])
+                    expected_max_label = 14 if '14' in self.label_type else 28
+                    if not (1 <= label_val <= expected_max_label):
+                         raise ValueError("Label value out of range")
+                    final_label = label_val - 1
+                except (KeyError, ValueError, TypeError) as e:
+                     subject_skipped_label += 1
+                     if final_label != -1: subject_invalid_label += 1
+                     # logger.debug(f"Label invalid/missing for {sample_id_base}")
+                     continue # 跳过标签无效的样本
+
+                # 读取数据 JSON
+                data_numpy = self._read_dhg_json(json_path, sample_id_base)
+
+                if data_numpy is not None:
+                    # 使用一个唯一ID，结合 subject 和 文件名，避免潜在冲突（虽然此场景下可能非必须）
+                    # unique_id = f"subj{current_subject_id}_{sample_id_base}"
+                    temp_sample_info.append({'id': sample_id_base, 'path': json_path}) # 存储基础 ID
+                    temp_label_list.append(final_label)
+                    temp_data_list.append(data_numpy)
+                    subject_loaded_count += 1
+                else:
+                    subject_skipped_data += 1
+                    # logger.debug(f"Failed to read/process JSON: {json_path}")
+
+            logger.debug(f"Subject {current_subject_id} Summary: Loaded={subject_loaded_count}, SkippedLabel={subject_skipped_label} (InvalidVal={subject_invalid_label}), SkippedData={subject_skipped_data}")
+            total_loaded_count += subject_loaded_count
+            total_skipped_label += subject_skipped_label
+            total_skipped_data += subject_skipped_data
+            total_invalid_label_value += subject_invalid_label
+
+        logger.info(f"Overall Data Loading Summary: Loaded={total_loaded_count}, SkippedLabel={total_skipped_label} (InvalidVal={total_invalid_label_value}), SkippedData={total_skipped_data}")
+
+        # 更新实例变量
         self.sample_info = temp_sample_info
-        self.label = temp_label
-        logger.info(f"数据加载完成。加载成功: {loaded_count}, 跳过(无效标签 {skipped_label}, 数据错误/缺失 {skipped_data})。")
+        self.label = temp_label_list
+        self.data = temp_data_list
+
 
     def _read_dhg_json(self, filepath, sample_id_for_debug):
-        """读取单个 DHG JSON 文件并提取骨骼数据 (基于样本结构)"""
+        """读取单个 DHG JSON 文件并提取骨骼数据"""
         try:
             with open(filepath, 'r', encoding='utf-8') as f: json_data = json.load(f)
             skeletons_data = json_data.get('skeletons')
-            if not skeletons_data or not isinstance(skeletons_data, list): raise ValueError("找不到 'skeletons' 列表或格式错误")
+            if not skeletons_data or not isinstance(skeletons_data, list):
+                if isinstance(json_data, list): skeletons_data = json_data
+                else: return None
+            if not skeletons_data: return None
 
             sequence = []
+            zero_frame = np.zeros((self.num_nodes, self.base_channel), dtype=np.float32)
             for frame_idx, frame_joints_coords in enumerate(skeletons_data):
                 if not isinstance(frame_joints_coords, list) or len(frame_joints_coords) == 0:
-                    if sequence: sequence.append(sequence[-1]); continue
-                    else: sequence.append(np.zeros((self.num_nodes, self.base_channel), dtype=np.float32)); continue
+                    sequence.append(zero_frame); continue
 
-                # 处理节点数
                 current_frame_joints_list = frame_joints_coords
-                if len(current_frame_joints_list) != self.num_nodes:
-                    if len(current_frame_joints_list) < self.num_nodes:
-                        padding = [[0.0] * self.base_channel] * (self.num_nodes - len(current_frame_joints_list))
+                original_node_count = len(current_frame_joints_list)
+                if original_node_count != self.num_nodes:
+                    if original_node_count < self.num_nodes:
+                        padding = [[0.0] * self.base_channel] * (self.num_nodes - original_node_count)
                         current_frame_joints_list.extend(padding)
                     else:
                         current_frame_joints_list = current_frame_joints_list[:self.num_nodes]
 
                 frame_data = []
-                valid_joint_count = 0
-                for joint_coords in current_frame_joints_list:
+                for joint_idx, joint_coords in enumerate(current_frame_joints_list):
                     if isinstance(joint_coords, list) and len(joint_coords) >= self.base_channel and all(isinstance(c, (int, float)) and np.isfinite(c) for c in joint_coords[:self.base_channel]):
                         frame_data.append(joint_coords[:self.base_channel])
-                        valid_joint_count += 1
-                    else:
-                        frame_data.append([0.0] * self.base_channel) # 无效坐标补零
-
-                # 基于有效关节点比例决定是否使用该帧
-                if valid_joint_count < self.num_nodes * 0.5:
-                     if sequence: sequence.append(sequence[-1])
-                     else: sequence.append(np.zeros((self.num_nodes, self.base_channel), dtype=np.float32))
-                else:
-                     sequence.append(np.array(frame_data, dtype=np.float32))
+                    else: frame_data.append([0.0] * self.base_channel)
+                sequence.append(np.array(frame_data, dtype=np.float32))
 
             if not sequence: return None
             data_numpy = np.stack(sequence, axis=0)
-            if not np.any(data_numpy): return None # 检查是否全零
+            raw_has_values = any(np.any(f) for f in skeletons_data if isinstance(f,list) and f for joint in f if isinstance(joint, list))
+            if not np.any(data_numpy) and raw_has_values:
+                 logger.warning(f"Processed sequence for {filepath} is all zeros, but original data had values. Returning None.")
+                 return None
             return data_numpy
-
-        except FileNotFoundError: logger.warning(f"找不到 JSON 文件: {filepath}"); return None
-        except Exception as e: logger.warning(f"加载或处理 DHG 文件 {filepath} 时出错 ({e})"); return None
+        except FileNotFoundError: return None
+        except json.JSONDecodeError: logger.warning(f"JSON decode error: {filepath}"); return None
+        except Exception as e: logger.warning(f"Error processing file {filepath}: {e}"); return None
 
     # --- 数据增强函数 ---
-    # (rand_view_transform, random_shear, random_flip(需谨慎使用), random_coordinate_dropout, random_joint_dropout)
-    # (代码与 v1.3 版本相同，此处省略以减少篇幅，请确保它们存在)
+    # (保持不变)
     def rand_view_transform(self, X, agx=None, agy=None, s=None):
+        if X.shape[-1] != 3: return X
         if agx is None: agx = random.randint(-60, 60);
         if agy is None: agy = random.randint(-60, 60);
         if s is None: s = random.uniform(0.7, 1.3);
@@ -292,7 +350,6 @@ class Feeder(Dataset):
         Ry = np.array([[math.cos(agy_rad),0,-math.sin(agy_rad)], [0,1,0], [math.sin(agy_rad),0,math.cos(agy_rad)]], dtype=X.dtype);
         Ss = np.array([[s,0,0],[0,s,0],[0,0,s]], dtype=X.dtype);
         orig_shape = X.shape;
-        if X.shape[-1] != 3: return X;
         X_transformed = np.dot(X.reshape(-1, 3), Ry @ Rx @ Ss);
         return X_transformed.reshape(orig_shape)
     def random_shear(self, X, amplitude=0.5):
@@ -306,36 +363,16 @@ class Feeder(Dataset):
         X_transformed = np.dot(X.reshape(-1, 3), shear_matrix);
         return X_transformed.reshape(T, N, C)
     def random_flip(self, X):
-        """随机水平翻转骨架 (如果 left/right parts 定义了)"""
-        logger.warning("DHG 的 Random Flip 未验证是否适用！请检查 left/right parts 定义。") # 添加更明确的警告
-
-        # 检查左右部分是否已定义，如果没有定义则直接返回
-        if not self.left_parts or not self.right_parts:
-            logger.debug("未定义 left_parts 或 right_parts，跳过翻转。") # 添加 debug 信息
-            return X
-
-        # 获取维度并检查通道数
+        if not self.left_parts or not self.right_parts: return X
         T, N, C = X.shape
-        if C != 3: # 只对 3D 坐标有效
-            logger.debug(f"输入通道数不为 3 ({C})，跳过翻转。")
-            return X
-
-        # 复制数据以避免修改原始数据
+        if C != 3: return X
         flipped_X = X.copy()
-        # 翻转 X 坐标 (假设 X 轴是水平轴)
         flipped_X[..., 0] *= -1
-
-        # 交换左右对应的关节点
         for l, r in zip(self.left_parts, self.right_parts):
-            # 确保索引有效
             if 0 <= l < N and 0 <= r < N:
-                # 使用临时变量或直接交换，避免数据覆盖问题 (虽然 numpy 可能处理得当，但这样更清晰)
-                temp_l_data = flipped_X[:, l, :].copy() # 显式复制
+                temp_l_data = flipped_X[:, l, :].copy()
                 flipped_X[:, l, :] = flipped_X[:, r, :]
                 flipped_X[:, r, :] = temp_l_data
-            else:
-                 logger.warning(f"翻转时索引越界: left={l}, right={r}, N={N}")
-
         return flipped_X
     def random_coordinate_dropout(self, X, prob=0.1, axis=None):
         T, N, C = X.shape;
@@ -352,21 +389,23 @@ class Feeder(Dataset):
             X[:, joints_to_drop, :] = 0;
         return X
 
-    # --- 时间采样和填充函数 ---
+    # --- 时间采样和衍生模态计算 ---
     def temporal_sampling(self, data_numpy):
         T_orig = data_numpy.shape[0]
         if T_orig == 0: return np.zeros((self.max_len, self.num_nodes, data_numpy.shape[-1]), dtype=data_numpy.dtype)
         if T_orig <= self.max_len: return data_numpy
-
         if self.random_choose:
-             indices = random.sample(range(T_orig), self.max_len); indices.sort(); return data_numpy[indices, :, :]
+             indices = random.sample(range(T_orig), self.max_len); indices.sort();
+             return data_numpy[indices, :, :]
         else:
-             indices = np.linspace(0, T_orig - 1, self.max_len).round().astype(int); indices = np.clip(indices, 0, T_orig - 1); return data_numpy[indices, :, :]
-
-    # --- 衍生模态计算函数 ---
+             indices = np.linspace(0, T_orig - 1, self.max_len).round().astype(int);
+             indices = np.clip(indices, 0, T_orig - 1);
+             return data_numpy[indices, :, :]
     def _get_bone_data(self, joint_data):
         bone_data = np.zeros_like(joint_data);
-        for v1, v2 in self.bone_pairs: bone_data[:, v1, :] = joint_data[:, v1, :] - joint_data[:, v2, :];
+        for v1, v2 in self.bone_pairs:
+             if 0 <= v1 < self.num_nodes and 0 <= v2 < self.num_nodes:
+                  bone_data[:, v1, :] = joint_data[:, v1, :] - joint_data[:, v2, :]
         return bone_data
     def _get_motion_data(self, data):
         motion_data = np.zeros_like(data); T = data.shape[0];
@@ -379,77 +418,137 @@ class Feeder(Dataset):
     def __getitem__(self, index):
         true_index = index % len(self.sample_info)
 
+        # --- 获取预加载的数据和标签 ---
         label = self.label[true_index]
-        joint_data_orig = self.data[true_index] # 直接从加载好的列表获取
+        joint_data_orig = self.data[true_index]
+        sample_id = self.sample_info[true_index]['id'] # 使用基础 ID
 
-        if joint_data_orig is None or label == -1:
-             # 返回零样本
-             zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float)
-             zero_label = torch.tensor(-1, dtype=torch.long)
-             zero_mask = torch.zeros(self.max_len, dtype=torch.bool)
-             return zero_data, zero_label, zero_mask, true_index
-
-        # 应用增强和处理
+        # --- 应用增强和处理 ---
         joint_data = joint_data_orig.copy()
-        if self.train_val == 'train':
-            # 中心化
-            center_joint_dhg = getattr(self, 'center_joint_idx', 0) # 使用配置或默认值 0
-            if center_joint_dhg is not None and 0 <= center_joint_dhg < self.num_nodes and joint_data.shape[0] > 0:
-                center_coord = joint_data[:, center_joint_dhg:center_joint_dhg+1, :]; joint_data = joint_data - center_coord
-            # 其他增强
+        if self.center_joint_idx is not None and 0 <= self.center_joint_idx < self.num_nodes and joint_data.shape[0] > 0:
+            center_coord = joint_data[:, self.center_joint_idx:self.center_joint_idx+1, :].copy()
+            joint_data = joint_data - center_coord
+        if self.split == 'train':
             if self.apply_random_shear: joint_data = self.random_shear(joint_data, self.shear_amplitude)
             if self.apply_rand_view_transform: joint_data = self.rand_view_transform(joint_data)
             if self.apply_random_flip and random.random() < 0.5: joint_data = self.random_flip(joint_data)
             if self.apply_coord_drop: joint_data = self.random_coordinate_dropout(joint_data, self.coord_drop_prob, self.coord_drop_axis)
             if self.apply_joint_drop: joint_data = self.random_joint_dropout(joint_data, self.joint_drop_prob)
-        else: # 验证/测试时只中心化
-            center_joint_dhg = getattr(self, 'center_joint_idx', 0)
-            if center_joint_dhg is not None and 0 <= center_joint_dhg < self.num_nodes and joint_data.shape[0] > 0:
-                 center_coord = joint_data[:, center_joint_dhg:center_joint_dhg+1, :]; joint_data = joint_data - center_coord
 
-        # 时间采样
+        # --- 时间采样 ---
         joint_data_sampled = self.temporal_sampling(joint_data)
+        if joint_data_sampled.shape[0] == 0:
+            logger.warning(f"Temporal sampling resulted in empty data for index {true_index} (sample_id: {sample_id}). Returning zero sample.")
+            zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(label, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
 
-        # 计算衍生模态和拼接
+        # --- 计算衍生模态和拼接 ---
         modal_data_list = []; data_bone_sampled = None
-        for modality in self.modalities:
-            if modality == 'joint': modal_data_list.append(joint_data_sampled)
-            elif modality == 'bone': data_bone_sampled = self._get_bone_data(joint_data_sampled); modal_data_list.append(data_bone_sampled)
-            elif modality == 'joint_motion': modal_data_list.append(self._get_motion_data(joint_data_sampled))
-            elif modality == 'bone_motion':
-                if data_bone_sampled is None: data_bone_sampled = self._get_bone_data(joint_data_sampled)
-                modal_data_list.append(self._get_motion_data(data_bone_sampled))
+        try:
+            for modality in self.modalities:
+                if modality == 'joint': modal_data_list.append(joint_data_sampled)
+                elif modality == 'bone': data_bone_sampled = self._get_bone_data(joint_data_sampled); modal_data_list.append(data_bone_sampled)
+                elif modality == 'joint_motion': modal_data_list.append(self._get_motion_data(joint_data_sampled))
+                elif modality == 'bone_motion':
+                    if data_bone_sampled is None: data_bone_sampled = self._get_bone_data(joint_data_sampled)
+                    modal_data_list.append(self._get_motion_data(data_bone_sampled))
+            if not modal_data_list: raise ValueError("No modalities generated.")
+            data_concatenated = np.concatenate(modal_data_list, axis=-1)
+            if data_concatenated.shape[-1] != self.num_input_dim:
+                raise ValueError(f"Concatenated channel ({data_concatenated.shape[-1]}) != expected ({self.num_input_dim})")
+        except Exception as e:
+             logger.error(f"样本 {sample_id}: 计算或拼接模态时出错: {e}. Returning zero sample.")
+             zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(label, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
 
-        if not modal_data_list: # 返回零样本
-             zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(-1, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
-
-        try: data_concatenated = np.concatenate(modal_data_list, axis=-1)
-        except ValueError as e: # 返回零样本
-             logger.error(f"样本 {self.sample_info[true_index]['id']} 拼接模态时出错: {e}"); zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(-1, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
-
-        # 填充与掩码
+        # --- 填充与掩码 ---
         data_padded, mask_np = pad_sequence_with_mask(data_concatenated, self.max_len, self.num_nodes, self.num_input_dim)
 
-        # 转换为 Tensor
+        # --- 转换为 Tensor ---
         try:
             data_tensor = torch.from_numpy(data_padded).float()
             label_tensor = torch.tensor(label, dtype=torch.long)
             mask_tensor = torch.from_numpy(mask_np).bool()
-        except Exception as e: # 返回零样本
-            logger.error(f"将样本 {self.sample_info[true_index]['id']} 转换为 Tensor 时出错: {e}"); zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(-1, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
+        except Exception as e:
+            logger.error(f"将样本 {sample_id} 转换为 Tensor 时出错: {e}. Returning zero sample.")
+            zero_data = torch.zeros((self.max_len, self.num_nodes, self.num_input_dim), dtype=torch.float); zero_label = torch.tensor(label, dtype=torch.long); zero_mask = torch.zeros(self.max_len, dtype=torch.bool); return zero_data, zero_label, zero_mask, true_index
 
+        # 返回 true_index
         return data_tensor, label_tensor, mask_tensor, true_index
 
     # --- top_k 方法 ---
     def top_k(self, score, top_k):
-        """计算 Top-K 准确率 (处理 0-based 和无效标签)"""
-        # (代码与 v1.3 版本相同)
-        rank = score.argsort(axis=1, descending=True)
         label_np = np.array(self.label)
         valid_indices = np.where(label_np != -1)[0]
         if len(valid_indices) == 0: return 0.0
-        valid_labels = label_np[valid_indices]; valid_rankings = rank[valid_indices, :]
+        if score.shape[0] == len(valid_indices):
+            valid_labels = label_np[valid_indices]
+            valid_rankings = score.argsort(axis=1, descending=True)
+        elif score.shape[0] == len(label_np):
+            valid_scores = score[valid_indices, :]
+            valid_labels = label_np[valid_indices]
+            valid_rankings = valid_scores.argsort(axis=1, descending=True)
+        else:
+             logger.error(f"top_k: score shape {score.shape} 无法与 label count {len(label_np)} 或 valid label count {len(valid_indices)} 匹配！")
+             return 0.0
         hit_count = 0
         for i in range(len(valid_labels)):
             if valid_labels[i] in valid_rankings[i, :top_k]: hit_count += 1
-        return hit_count * 1.0 / len(valid_labels)
+        return hit_count * 1.0 / (len(valid_labels) + 1e-6)
+
+
+# --- 单元测试 ---
+if __name__ == '__main__':
+    # 设置日志级别为 INFO 或 DEBUG
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)-8s - %(name)s - %(message)s')
+    logger.info("测试 Feeder for DHG14-28 (v2.0 - 完全修正 LOSO 加载逻辑)...")
+
+    # --- !!! 修改为你的实际路径 !!! ---
+    test_root_dir = 'data/DHG14-28/DHG14-28_sample_json'
+    test_subject_for_val = 1
+    # ---------------------------------
+
+    if not os.path.isdir(test_root_dir): logger.error("测试根目录无效!"); sys.exit(1)
+
+    def collate_fn_filter_none(batch):
+        batch = [item for item in batch if item is not None and item[1] is not None and item[1].item() != -1]
+        if not batch: return None
+        try:
+             from torch.utils.data.dataloader import default_collate; return default_collate(batch)
+        except Exception as e: logger.error(f"CollateFn 错误: {e}"); return None
+
+    try:
+        logger.info(f"\n--- 测试训练集 (留出 Subject {test_subject_for_val}) ---")
+        train_args = {'root_dir': test_root_dir, 'subject_idx': test_subject_for_val, 'split': 'train','label_type': 'label_14', 'max_len': 120, 'data_path': 'joint,bone', 'num_classes': 14, 'debug': False}
+        train_dataset = Feeder(**train_args)
+        logger.info(f"训练集样本数: {len(train_dataset)}")
+        if len(train_dataset) > 0:
+            from torch.utils.data import DataLoader
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, collate_fn=collate_fn_filter_none, pin_memory=True)
+            logger.info("开始迭代训练数据 (最多5批)...")
+            batch_count = 0
+            for i, batch_data in enumerate(tqdm(train_loader, desc="Train Batches")):
+                if batch_data is None: logger.warning(f"训练 Batch {i} 为 None"); continue
+                xb, lb, mb, idxb = batch_data; batch_count += 1
+                if i < 2: logger.info(f" Batch {i}: X={xb.shape}, L={lb.shape}, M={mb.shape}, Idx={idxb}")
+                if batch_count >= 5: break
+            logger.info(f"训练数据迭代完成 ({batch_count} 批)。")
+        else: logger.warning("训练集为空！")
+
+        logger.info(f"\n--- 测试验证集 (Subject {test_subject_for_val}) ---")
+        val_args = {'root_dir': test_root_dir, 'subject_idx': test_subject_for_val, 'split': 'val', 'label_type': 'label_28', 'max_len': 150, 'data_path': 'joint', 'num_classes': 28, 'debug': False}
+        val_dataset = Feeder(**val_args)
+        logger.info(f"验证集样本数: {len(val_dataset)}")
+        if len(val_dataset) > 0:
+            from torch.utils.data import DataLoader
+            val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=collate_fn_filter_none, pin_memory=True)
+            logger.info("开始迭代验证数据 (最多5批)...")
+            batch_count = 0
+            for i, batch_data in enumerate(tqdm(val_loader, desc="Val Batches")):
+                if batch_data is None: logger.warning(f"验证 Batch {i} 为 None"); continue
+                xb_v, lb_v, mb_v, idxb_v = batch_data; batch_count += 1
+                if i < 2: logger.info(f" Batch {i}: X={xb_v.shape}, L={lb_v.shape}, M={mb_v.shape}, Idx={idxb_v}")
+                if batch_count >= 5: break
+            logger.info(f"验证数据迭代完成 ({batch_count} 批)。")
+        else: logger.warning("验证集为空！")
+
+    except Exception as e:
+         logger.error(f"单元测试过程中出错: {e}", exc_info=True)

@@ -1,49 +1,35 @@
 # -*- coding: utf-8 -*-
-# 文件名: feeders/feeder_ucla.py (v1.2 - 支持多模态拼接和类别相关增强)
+# 文件名: feeders/feeder_ucla.py (v1.7 - 修正采样逻辑, 硬编码列表, JSON到内存, 多模态, 增强)
 
-import torch
-import pickle
-import numpy as np
+import os
+import json
 import random
 import math
-import json # <--- 确保导入 json 模块
-import os
-import glob
-import sys
-import traceback
 import logging
-from torch.utils.data import Dataset, DataLoader
 
-# 获取 logger 实例
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm # 用于 load_data 显示进度
+
 logger = logging.getLogger(__name__)
 
-# --- 辅助函数 ---
-
-def pad_sequence(seq, max_len, pad_value=0.0):
-    """将序列填充/截断到指定长度，并返回序列和掩码"""
-    if seq is None or seq.size == 0: # 使用 .size 检查 numpy 数组是否为空
-        # 尝试获取维度信息，如果不可能，使用默认值
-        # 注意: 这里的默认通道数需要谨慎设置，最好能从外部获取或推断
-        num_nodes = 20 # NW-UCLA 默认值
-        num_channels = 3 # 基础维度
-        # logger.warning(f"pad_sequence 收到空序列或 None，返回全零填充 (默认维度 {num_nodes}x{num_channels})。")
+# --- 辅助函数：pad_sequence, joint_to_bone, joint_to_motion (保持不变) ---
+def pad_sequence(seq, max_len, num_nodes, num_channels, pad_value=0.0):
+    if seq is None or seq.size == 0:
         padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
         mask = np.zeros(max_len, dtype=bool)
         return padded_seq, mask
-
     seq_len = seq.shape[0]
-    # 处理 seq_len 可能为 0 的情况
     if seq_len == 0:
-        # logger.warning(f"pad_sequence 收到长度为 0 的序列，返回全零填充。")
-        num_nodes = seq.shape[1] if seq.ndim > 1 else 20
-        num_channels = seq.shape[2] if seq.ndim > 2 else 3 # 获取实际通道数
         padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
         mask = np.zeros(max_len, dtype=bool)
         return padded_seq, mask
-
-    num_nodes = seq.shape[1]
-    num_channels = seq.shape[2] # 获取实际通道数
-
+    if seq.ndim != 3 or seq.shape[1] != num_nodes or seq.shape[2] != num_channels:
+         logger.error(f"Pad input seq shape {seq.shape} mismatch expected (T, {num_nodes}, {num_channels}).")
+         padded_seq = np.full((max_len, num_nodes, num_channels), pad_value, dtype=np.float32)
+         mask = np.zeros(max_len, dtype=bool)
+         return padded_seq, mask
     if seq_len < max_len:
         pad_len = max_len - seq_len
         padding = np.full((pad_len, num_nodes, num_channels), pad_value, dtype=seq.dtype)
@@ -58,19 +44,17 @@ def pad_sequence(seq, max_len, pad_value=0.0):
     return padded_seq, mask
 
 def joint_to_bone(data_numpy, bone_pairs, num_nodes):
-    """根据关节坐标计算骨骼向量"""
-    T, N, C = data_numpy.shape
+    T, N, C_base = data_numpy.shape
+    if C_base != 3: # 确保只对原始3通道数据操作
+        raise ValueError(f"joint_to_bone 期望输入数据有3个通道，但得到 {C_base} 个。请确保传递的是原始joint数据。")
     data_bone = np.zeros_like(data_numpy)
-    for v1, v2 in bone_pairs:
+    for v1, v2 in bone_pairs: # bone_pairs 应该是 1-based
         idx1, idx2 = v1 - 1, v2 - 1
         if 0 <= idx1 < num_nodes and 0 <= idx2 < num_nodes:
             data_bone[:, idx1, :] = data_numpy[:, idx1, :] - data_numpy[:, idx2, :]
-        else:
-             pass # 减少日志噪音
     return data_bone
 
 def joint_to_motion(data_numpy):
-    """计算帧间运动向量（差分）"""
     data_motion = np.zeros_like(data_numpy)
     T = data_numpy.shape[0]
     if T > 1:
@@ -78,439 +62,354 @@ def joint_to_motion(data_numpy):
         data_motion[T-1, :, :] = data_motion[T-2, :, :]
     return data_motion
 
-
 class Feeder(Dataset):
-    """ NW-UCLA 数据集的 Feeder 类 (支持多模态拼接和类别相关增强) """
-    def __init__(self, data_path='joint', label_path=None, repeat=1, random_choose=False, random_shift=False, random_move=False,
-                 window_size=-1, normalization=False, debug=False, use_mmap=False,
-                 root_dir=None, split='train', center_joint_idx=1, apply_rand_view_transform=True,
-                 val_pkl_path='data/nw-ucla/val_label.pkl', bone_pairs=None,
-                 num_classes=10, max_len=64,
-                 # --- 类别相关增强参数 ---
-                 augment_confused_classes=False, # 默认关闭
-                 confused_classes_list=None, # 默认无特定类别
-                 confused_rotation_range=(-75, 75), # 默认增强旋转范围
-                 confused_scale_range=(0.4, 1.6),   # 默认增强缩放范围
-                 add_gaussian_noise=False,        # 默认不添加高斯噪声
-                 gaussian_noise_level=0.01        # 默认噪声水平
-                 ):
+    def __init__(self,
+                 root_dir,
+                 split,
+                 data_path,
+                 max_len,
+                 num_classes=10,
+                 base_channel=3,
+                 repeat=1,
+                 random_choose=False, # 这个参数现在用于控制 _temporal_sampling 的行为
+                 center_joint_idx=1,
+                 apply_rand_view_transform=False,
+                 augment_confused_classes=False,
+                 confused_classes_list=None,
+                 confused_rotation_range=(-60, 60),
+                 confused_scale_range=(0.5, 1.5),
+                 add_gaussian_noise=False,
+                 gaussian_noise_level=0.01,
+                 debug=False,
+                 label_path=None, # 用于辅助判断 train/val 来选择硬编码列表
+                 window_size=-1,
+                 normalization=False,
+                 **kwargs):
         super().__init__()
-        # --- 参数检查与赋值 ---
-        if root_dir is None or not os.path.isdir(root_dir): raise ValueError(f"无效的数据集根目录 'root_dir': {root_dir}")
-        if split not in ['train', 'val', 'test']: raise ValueError(f"无效的 split 参数: {split}")
+
+        if not os.path.isdir(root_dir):
+            raise FileNotFoundError(f"Feeder错误: 原始 JSON 数据根目录 '{root_dir}' 未找到。")
 
         self.root_dir = root_dir
-        self.split = 'train' if split == 'train' else 'val'
-        self.train_val = split
-        self.repeat = repeat if self.train_val == 'train' else 1
-        self.max_len = max_len if max_len > 0 else (window_size if window_size > 0 else 64)
-        self.num_nodes = 20
-        self.num_base_input_dim = 3 # 基础模态 (joint) 的维度
+        self.split = split
+        # 根据 split 和 label_path (如果提供) 来确定是训练还是验证模式，用于选择硬编码列表
+        if self.split.lower() in ['val', 'test']:
+            self.train_val_flag = 'val'
+        elif self.split.lower() == 'train':
+            self.train_val_flag = 'train'
+        elif label_path and 'val' in label_path.lower(): # Fallback for compatibility
+            self.train_val_flag = 'val'
+            logger.warning(f"split 参数为 '{self.split}'，但 label_path ('{label_path}')包含'val'，将使用验证集列表。")
+        else:
+            self.train_val_flag = 'train'
+            if not (label_path and 'train' in label_path.lower()) and self.split.lower() not in ['train', 'val', 'test']:
+                 logger.warning(f"split 参数 ('{self.split}') 和 label_path ('{label_path}') 都无法明确确定 train/val，默认为训练集。")
+
+        self.modalities_str = data_path
+        self.target_seq_len = max_len if max_len > 0 else (window_size if window_size > 0 else 64)
+        self.max_len = self.target_seq_len
+        if self.target_seq_len <=0: raise ValueError("max_len 或 window_size 必须是正数")
+
         self.num_classes = num_classes
-        self.center_joint_idx = center_joint_idx if isinstance(center_joint_idx, int) and 0 <= center_joint_idx < self.num_nodes else None
-        self.apply_rand_view_transform = apply_rand_view_transform if self.train_val == 'train' else False
-        self.random_choose = random_choose if self.train_val == 'train' else False
+        self.base_channel = base_channel
+        self.repeat = repeat if self.train_val_flag == 'train' else 1
+        self.random_choose_for_sampling = random_choose if self.train_val_flag == 'train' else False # 重命名以区分
+        self.center_joint_idx = center_joint_idx
+        self.apply_rand_view_transform = apply_rand_view_transform if self.train_val_flag == 'train' else False
+        self.apply_normalization = normalization
         self.debug = debug
 
-        # --- 解析多模态 ---
-        if isinstance(data_path, str): self.modalities = [m.strip().lower() for m in data_path.split(',') if m.strip()]
-        elif isinstance(data_path, list): self.modalities = [m.strip().lower() for m in data_path if isinstance(m, str) and m.strip()]
-        else: raise ValueError("data_path 必须是逗号分隔的字符串或字符串列表")
+        self.num_nodes = 20
+        self.bone_pairs = [(1, 2), (2, 3), (3, 3), (4, 3), (5, 3), (6, 5), (7, 6), (8, 7), (9, 3), (10, 9), (11, 10),
+                           (12, 11), (13, 1), (14, 13), (15, 14), (16, 15), (17, 1), (18, 17), (19, 18), (20, 19)]
+
+        if isinstance(self.modalities_str, str):
+            self.modalities = [m.strip().lower() for m in self.modalities_str.split(',') if m.strip()]
+        # ... (其余的 __init__ 参数设置和日志打印与 v1.6 相同) ...
+        else:
+            raise ValueError("Feeder的 data_path 必须是逗号分隔的字符串。")
         valid_modalities = ['joint', 'bone', 'joint_motion', 'bone_motion']
         for m in self.modalities:
             if m not in valid_modalities: raise ValueError(f"不支持的数据模态: '{m}'. 支持: {valid_modalities}")
         if not self.modalities: raise ValueError("必须至少指定一种数据模态 (data_path)")
-        self.num_input_dim = self.num_base_input_dim * len(self.modalities)
+        self.num_input_dim = self.base_channel * len(self.modalities)
 
-        # --- 骨骼连接对 ---
-        if bone_pairs is None: self.bone_pairs = [(1, 2), (2, 3), (3, 3), (4, 3), (5, 3), (6, 5), (7, 6), (8, 7), (9, 3), (10, 9), (11, 10), (12, 11), (13, 1), (14, 13), (15, 14), (16, 15), (17, 1), (18, 17), (19, 18), (20, 19)]
-        else: self.bone_pairs = bone_pairs
-        self.val_pkl_path = val_pkl_path
-
-        # --- 存储类别相关增强参数 ---
-        self.augment_confused_classes = augment_confused_classes if self.train_val == 'train' else False
+        self.augment_confused_classes = augment_confused_classes if self.train_val_flag == 'train' else False
         self.confused_classes_set = set(confused_classes_list) if confused_classes_list else set()
         self.confused_rotation_range = confused_rotation_range
         self.confused_scale_range = confused_scale_range
-        self.add_gaussian_noise = add_gaussian_noise if self.train_val == 'train' else False
+        self.add_gaussian_noise = add_gaussian_noise if self.train_val_flag == 'train' else False
         self.gaussian_noise_level = gaussian_noise_level
-        if self.augment_confused_classes:
-            logger.info(f"训练时将对类别 {list(self.confused_classes_set)} 应用特殊增强 (旋转范围: {self.confused_rotation_range}, 缩放范围: {self.confused_scale_range}, 添加高斯噪声: {self.add_gaussian_noise})")
 
-        # --- 打印初始化信息 ---
-        logger.info(f"初始化 Feeder for NW-UCLA: split={self.train_val}, root_dir={self.root_dir}")
-        logger.info(f"加载模态: {self.modalities}, 目标序列长度: {self.max_len}")
-        logger.info(f"基础输入维度: {self.num_base_input_dim}, 拼接后总维度: {self.num_input_dim}")
-        logger.info(f"类别数: {self.num_classes}")
-        if self.split == 'val': logger.info(f"验证/测试集 PKL 路径: {self.val_pkl_path}")
+        logger.info(f"初始化 Feeder for NW-UCLA ({self.split} - 使用 '{self.train_val_flag}' 列表) - v1.7:")
+        logger.info(f"  JSON 数据目录: {self.root_dir}")
+        logger.info(f"  加载模态: {self.modalities}, 总输入维度: {self.num_input_dim}")
 
-        # --- 加载数据 ---
-        self.sample_info = [] # 存储 {'path': ..., 'id': ...}
-        self.label = []       # 存储 0-based 标签
-        self._load_data() # 加载样本信息和标签
 
-        # --- 加载后检查 ---
-        if not self.sample_info: raise RuntimeError(f"未能加载任何样本信息 for split '{self.train_val}' in '{self.root_dir}'.")
-        if len(self.sample_info) != len(self.label):
-             logger.error(f"样本信息 ({len(self.sample_info)}) 和标签 ({len(self.label)}) 数量不匹配！ Split: {self.train_val}")
-             raise RuntimeError(f"样本信息 ({len(self.sample_info)}) 和标签 ({len(self.label)}) 数量不匹配！ Split: {self.train_val}")
+        # --- 硬编码样本列表 ---
+        self.data_dict_raw = []
+        if self.train_val_flag == 'val':
+            logger.info("  为验证/测试集加载硬编码列表...")
+            # vvvvvvvvvvvvvvvvvvvvvvvvvv 请将 TD-GCN Feeder 中的验证集 data_dict 内容完整粘贴到这里 vvvvvvvvvvvvvvvvvvvvvvvvvv
+            self.data_dict_raw = [{"file_name": "a05_s04_e02_v03", "length": 21, "label": 5}, {"file_name": "a12_s09_e04_v03", "length": 26, "label": 10}, {"file_name": "a03_s03_e04_v03", "length": 35, "label": 3}, {"file_name": "a08_s02_e01_v03", "length": 101, "label": 7}, {"file_name": "a03_s05_e03_v03", "length": 26, "label": 3}, {"file_name": "a12_s10_e01_v03", "length": 21, "label": 10}, {"file_name": "a01_s07_e03_v03", "length": 31, "label": 1}, {"file_name": "a03_s08_e02_v03", "length": 21, "label": 3}, {"file_name": "a11_s10_e03_v03", "length": 51, "label": 9}, {"file_name": "a11_s03_e00_v03", "length": 46, "label": 9}, {"file_name": "a03_s02_e00_v03", "length": 32, "label": 3}, {"file_name": "a11_s01_e04_v03", "length": 16, "label": 9}, {"file_name": "a09_s08_e04_v03", "length": 63, "label": 8}, {"file_name": "a09_s06_e01_v03", "length": 41, "label": 8}, {"file_name": "a09_s07_e01_v03", "length": 51, "label": 8}, {"file_name": "a02_s08_e01_v03", "length": 21, "label": 2}, {"file_name": "a01_s04_e01_v03", "length": 23, "label": 1}, {"file_name": "a02_s02_e02_v03", "length": 31, "label": 2}, {"file_name": "a02_s07_e05_v03", "length": 31, "label": 2}, {"file_name": "a06_s02_e00_v03", "length": 16, "label": 6}, {"file_name": "a03_s02_e02_v03", "length": 22, "label": 3}, {"file_name": "a11_s09_e04_v03", "length": 22, "label": 9}, {"file_name": "a09_s03_e04_v03", "length": 61, "label": 8}, {"file_name": "a04_s01_e02_v03", "length": 23, "label": 4}, {"file_name": "a12_s01_e01_v03", "length": 17, "label": 10}, {"file_name": "a02_s07_e03_v03", "length": 9, "label": 2}, {"file_name": "a05_s08_e04_v03", "length": 19, "label": 5}, {"file_name": "a02_s07_e02_v03", "length": 31, "label": 2}, {"file_name": "a04_s07_e02_v03", "length": 16, "label": 4}, {"file_name": "a01_s08_e03_v03", "length": 27, "label": 1}, {"file_name": "a08_s03_e01_v03", "length": 68, "label": 7}, {"file_name": "a04_s08_e03_v03", "length": 21, "label": 4}, {"file_name": "a03_s10_e00_v03", "length": 17, "label": 3}, {"file_name": "a04_s03_e03_v03", "length": 21, "label": 4}, {"file_name": "a06_s06_e02_v03", "length": 21, "label": 6}, {"file_name": "a09_s03_e00_v03", "length": 81, "label": 8}, {"file_name": "a09_s03_e03_v03", "length": 46, "label": 8}, {"file_name": "a04_s02_e02_v03", "length": 21, "label": 4}, {"file_name": "a08_s01_e02_v03", "length": 78, "label": 7}, {"file_name": "a04_s04_e00_v03", "length": 11, "label": 4}, {"file_name": "a03_s02_e03_v03", "length": 39, "label": 3}, {"file_name": "a05_s04_e00_v03", "length": 21, "label": 5}, {"file_name": "a05_s07_e03_v03", "length": 36, "label": 5}, {"file_name": "a06_s10_e00_v03", "length": 31, "label": 6}, {"file_name": "a11_s07_e00_v03", "length": 31, "label": 9}, {"file_name": "a03_s01_e01_v03", "length": 24, "label": 3}, {"file_name": "a04_s06_e01_v03", "length": 16, "label": 4}, {"file_name": "a08_s02_e04_v03", "length": 96, "label": 7}, {"file_name": "a09_s08_e03_v03", "length": 46, "label": 8}, {"file_name": "a05_s07_e00_v03", "length": 36, "label": 5}, {"file_name": "a05_s02_e02_v03", "length": 21, "label": 5}, {"file_name": "a04_s06_e04_v03", "length": 21, "label": 4}, {"file_name": "a05_s09_e03_v03", "length": 21, "label": 5}, {"file_name": "a03_s06_e02_v03", "length": 15, "label": 3}, {"file_name": "a01_s01_e00_v03", "length": 27, "label": 1}, {"file_name": "a06_s06_e03_v03", "length": 11, "label": 6}, {"file_name": "a06_s10_e02_v03", "length": 25, "label": 6}, {"file_name": "a02_s07_e04_v03", "length": 36, "label": 2}, {"file_name": "a09_s06_e00_v03", "length": 80, "label": 8}, {"file_name": "a04_s07_e04_v03", "length": 16, "label": 4}, {"file_name": "a05_s02_e01_v03", "length": 19, "label": 5}, {"file_name": "a01_s06_e04_v03", "length": 17, "label": 1}, {"file_name": "a04_s08_e01_v03", "length": 17, "label": 4}, {"file_name": "a01_s09_e00_v03", "length": 31, "label": 1}, {"file_name": "a08_s03_e03_v03", "length": 67, "label": 7}, {"file_name": "a12_s03_e00_v03", "length": 21, "label": 10}, {"file_name": "a11_s02_e03_v03", "length": 29, "label": 9}, {"file_name": "a12_s07_e02_v03", "length": 13, "label": 10}, {"file_name": "a05_s06_e01_v03", "length": 16, "label": 5}, {"file_name": "a06_s02_e04_v03", "length": 16, "label": 6}, {"file_name": "a06_s04_e00_v03", "length": 16, "label": 6}, {"file_name": "a05_s09_e01_v03", "length": 26, "label": 5}, {"file_name": "a11_s10_e04_v03", "length": 24, "label": 9}, {"file_name": "a03_s01_e00_v03", "length": 33, "label": 3}, {"file_name": "a11_s02_e01_v03", "length": 14, "label": 9}, {"file_name": "a04_s02_e00_v03", "length": 31, "label": 4}, {"file_name": "a11_s01_e01_v03", "length": 14, "label": 9}, {"file_name": "a02_s06_e03_v03", "length": 21, "label": 2}, {"file_name": "a12_s10_e03_v03", "length": 16, "label": 10}, {"file_name": "a01_s06_e00_v03", "length": 21, "label": 1}, {"file_name": "a05_s07_e01_v03", "length": 41, "label": 5}, {"file_name": "a01_s09_e01_v03", "length": 26, "label": 1}, {"file_name": "a02_s06_e00_v03", "length": 18, "label": 2}, {"file_name": "a11_s09_e00_v03", "length": 26, "label": 9}, {"file_name": "a03_s03_e01_v03", "length": 47, "label": 3}, {"file_name": "a03_s08_e00_v03", "length": 22, "label": 3}, {"file_name": "a06_s04_e01_v03", "length": 21, "label": 6}, {"file_name": "a02_s05_e01_v03", "length": 34, "label": 2}, {"file_name": "a03_s04_e04_v03", "length": 29, "label": 3}, {"file_name": "a01_s09_e02_v03", "length": 26, "label": 1}, {"file_name": "a08_s03_e04_v03", "length": 46, "label": 7}, {"file_name": "a01_s10_e00_v03", "length": 6, "label": 1}, {"file_name": "a01_s02_e02_v03", "length": 26, "label": 1}, {"file_name": "a09_s03_e01_v03", "length": 36, "label": 8}, {"file_name": "a05_s06_e00_v03", "length": 26, "label": 5}, {"file_name": "a05_s01_e02_v03", "length": 22, "label": 5}, {"file_name": "a02_s02_e04_v03", "length": 28, "label": 2}, {"file_name": "a06_s07_e03_v03", "length": 26, "label": 6}, {"file_name": "a04_s02_e04_v03", "length": 16, "label": 4}, {"file_name": "a02_s07_e01_v03", "length": 31, "label": 2}, {"file_name": "a03_s07_e03_v03", "length": 11, "label": 3}, {"file_name": "a12_s08_e01_v03", "length": 16, "label": 10}, {"file_name": "a05_s01_e03_v03", "length": 19, "label": 5}, {"file_name": "a02_s09_e02_v03", "length": 43, "label": 2}, {"file_name": "a05_s08_e03_v03", "length": 26, "label": 5}, {"file_name": "a04_s06_e00_v03", "length": 16, "label": 4}, {"file_name": "a09_s01_e02_v03", "length": 41, "label": 8}, {"file_name": "a12_s09_e00_v03", "length": 24, "label": 10}, {"file_name": "a04_s09_e02_v03", "length": 26, "label": 4}, {"file_name": "a03_s03_e03_v03", "length": 43, "label": 3}, {"file_name": "a08_s07_e03_v03", "length": 63, "label": 7}, {"file_name": "a08_s09_e02_v03", "length": 134, "label": 7}, {"file_name": "a08_s09_e00_v03", "length": 91, "label": 7}, {"file_name": "a06_s06_e04_v03", "length": 11, "label": 6}, {"file_name": "a01_s07_e04_v03", "length": 26, "label": 1}, {"file_name": "a05_s04_e01_v03", "length": 24, "label": 5}, {"file_name": "a04_s07_e00_v03", "length": 21, "label": 4}, {"file_name": "a05_s08_e01_v03", "length": 21, "label": 5}, {"file_name": "a11_s06_e03_v03", "length": 16, "label": 9}, {"file_name": "a01_s04_e03_v03", "length": 21, "label": 1}, {"file_name": "a11_s06_e04_v03", "length": 12, "label": 9}, {"file_name": "a12_s07_e03_v03", "length": 21, "label": 10}, {"file_name": "a06_s07_e05_v03", "length": 21, "label": 6}, {"file_name": "a01_s02_e04_v03", "length": 23, "label": 1}, {"file_name": "a03_s01_e03_v03", "length": 36, "label": 3}, {"file_name": "a12_s02_e02_v03", "length": 21, "label": 10}, {"file_name": "a03_s06_e01_v03", "length": 17, "label": 3}, {"file_name": "a05_s02_e03_v03", "length": 21, "label": 5}, {"file_name": "a03_s02_e04_v03", "length": 23, "label": 3}, {"file_name": "a08_s02_e03_v03", "length": 103, "label": 7}, {"file_name": "a08_s03_e02_v03", "length": 66, "label": 7}, {"file_name": "a09_s01_e01_v03", "length": 40, "label": 8}, {"file_name": "a02_s01_e01_v03", "length": 30, "label": 2}, {"file_name": "a08_s06_e00_v03", "length": 96, "label": 7}, {"file_name": "a12_s08_e02_v03", "length": 16, "label": 10}, {"file_name": "a02_s08_e00_v03", "length": 26, "label": 2}, {"file_name": "a01_s08_e02_v03", "length": 36, "label": 1}, {"file_name": "a09_s04_e01_v03", "length": 36, "label": 8}, {"file_name": "a04_s01_e04_v03", "length": 16, "label": 4}, {"file_name": "a08_s10_e03_v03", "length": 68, "label": 7}, {"file_name": "a02_s05_e00_v03", "length": 28, "label": 2}, {"file_name": "a06_s04_e03_v03", "length": 16, "label": 6}, {"file_name": "a06_s09_e03_v03", "length": 21, "label": 6}, {"file_name": "a05_s03_e02_v03", "length": 21, "label": 5}, {"file_name": "a06_s03_e04_v03", "length": 16, "label": 6}, {"file_name": "a06_s01_e03_v03", "length": 21, "label": 6}, {"file_name": "a11_s03_e01_v03", "length": 21, "label": 9}, {"file_name": "a09_s02_e01_v03", "length": 31, "label": 8}, {"file_name": "a02_s02_e00_v03", "length": 42, "label": 2}, {"file_name": "a01_s01_e03_v03", "length": 25, "label": 1}, {"file_name": "a08_s06_e02_v03", "length": 93, "label": 7}, {"file_name": "a12_s01_e03_v03", "length": 18, "label": 10}, {"file_name": "a09_s09_e01_v03", "length": 56, "label": 8}, {"file_name": "a04_s10_e03_v03", "length": 16, "label": 4}, {"file_name": "a06_s09_e04_v03", "length": 16, "label": 6}, {"file_name": "a02_s04_e01_v03", "length": 31, "label": 2}, {"file_name": "a12_s10_e04_v03", "length": 21, "label": 10}, {"file_name": "a06_s03_e01_v03", "length": 26, "label": 6}, {"file_name": "a02_s03_e04_v03", "length": 62, "label": 2}, {"file_name": "a11_s09_e02_v03", "length": 26, "label": 9}, {"file_name": "a08_s08_e02_v03", "length": 51, "label": 7}, {"file_name": "a03_s02_e01_v03", "length": 36, "label": 3}, {"file_name": "a12_s02_e00_v03", "length": 19, "label": 10}, {"file_name": "a12_s08_e03_v03", "length": 14, "label": 10}, {"file_name": "a02_s09_e03_v03", "length": 31, "label": 2}, {"file_name": "a09_s02_e02_v03", "length": 33, "label": 8}, {"file_name": "a05_s09_e04_v03", "length": 21, "label": 5}, {"file_name": "a01_s04_e00_v03", "length": 21, "label": 1}, {"file_name": "a08_s04_e03_v03", "length": 68, "label": 7}, {"file_name": "a12_s09_e03_v03", "length": 17, "label": 10}, {"file_name": "a02_s04_e03_v03", "length": 31, "label": 2}, {"file_name": "a04_s03_e04_v03", "length": 21, "label": 4}, {"file_name": "a12_s06_e01_v03", "length": 11, "label": 10}, {"file_name": "a11_s04_e03_v03", "length": 36, "label": 9}, {"file_name": "a05_s03_e00_v03", "length": 20, "label": 5}, {"file_name": "a12_s07_e00_v03", "length": 11, "label": 10}, {"file_name": "a06_s03_e02_v03", "length": 21, "label": 6}, {"file_name": "a03_s03_e05_v03", "length": 33, "label": 3}, {"file_name": "a11_s08_e01_v03", "length": 26, "label": 9}, {"file_name": "a06_s10_e01_v03", "length": 21, "label": 6}, {"file_name": "a04_s03_e02_v03", "length": 11, "label": 4}, {"file_name": "a02_s03_e03_v03", "length": 56, "label": 2}, {"file_name": "a09_s10_e04_v03", "length": 51, "label": 8}, {"file_name": "a04_s08_e04_v03", "length": 21, "label": 4}, {"file_name": "a11_s08_e00_v03", "length": 35, "label": 9}, {"file_name": "a02_s01_e00_v03", "length": 39, "label": 2}, {"file_name": "a04_s02_e03_v03", "length": 19, "label": 4}, {"file_name": "a04_s02_e01_v03", "length": 36, "label": 4}, {"file_name": "a06_s08_e00_v03", "length": 21, "label": 6}, {"file_name": "a08_s08_e01_v03", "length": 52, "label": 7}, {"file_name": "a02_s03_e01_v03", "length": 45, "label": 2}, {"file_name": "a11_s02_e02_v03", "length": 29, "label": 9}, {"file_name": "a09_s07_e02_v03", "length": 38, "label": 8}, {"file_name": "a02_s05_e03_v03", "length": 21, "label": 2}, {"file_name": "a01_s07_e02_v03", "length": 31, "label": 1}, {"file_name": "a03_s05_e00_v03", "length": 20, "label": 3}, {"file_name": "a09_s03_e02_v03", "length": 38, "label": 8}, {"file_name": "a01_s03_e07_v03", "length": 28, "label": 1}, {"file_name": "a09_s04_e04_v03", "length": 56, "label": 8}, {"file_name": "a11_s10_e00_v03", "length": 16, "label": 9}, {"file_name": "a04_s04_e01_v03", "length": 13, "label": 4}, {"file_name": "a02_s08_e02_v03", "length": 21, "label": 2}, {"file_name": "a04_s01_e07_v03", "length": 16, "label": 4}, {"file_name": "a11_s06_e00_v03", "length": 26, "label": 9}, {"file_name": "a05_s02_e00_v03", "length": 27, "label": 5}, {"file_name": "a02_s02_e03_v03", "length": 29, "label": 2}, {"file_name": "a05_s06_e02_v03", "length": 16, "label": 5}, {"file_name": "a08_s01_e03_v03", "length": 76, "label": 7}, {"file_name": "a08_s09_e01_v03", "length": 91, "label": 7}, {"file_name": "a02_s08_e04_v03", "length": 36, "label": 2}, {"file_name": "a01_s02_e03_v03", "length": 29, "label": 1}, {"file_name": "a11_s08_e05_v03", "length": 28, "label": 9}, {"file_name": "a03_s09_e02_v03", "length": 26, "label": 3}, {"file_name": "a04_s08_e00_v03", "length": 17, "label": 4}, {"file_name": "a12_s03_e04_v03", "length": 16, "label": 10}, {"file_name": "a08_s04_e01_v03", "length": 56, "label": 7}, {"file_name": "a12_s04_e03_v03", "length": 11, "label": 10}, {"file_name": "a04_s09_e03_v03", "length": 31, "label": 4}, {"file_name": "a05_s06_e03_v03", "length": 26, "label": 5}, {"file_name": "a09_s06_e02_v03", "length": 56, "label": 8}, {"file_name": "a06_s08_e05_v03", "length": 21, "label": 6}, {"file_name": "a12_s02_e03_v03", "length": 21, "label": 10}, {"file_name": "a11_s03_e03_v03", "length": 36, "label": 9}, {"file_name": "a11_s07_e04_v03", "length": 23, "label": 9}, {"file_name": "a04_s01_e00_v03", "length": 31, "label": 4}, {"file_name": "a03_s08_e03_v03", "length": 14, "label": 3}, {"file_name": "a04_s10_e00_v03", "length": 12, "label": 4}, {"file_name": "a08_s03_e00_v03", "length": 86, "label": 7}, {"file_name": "a02_s08_e03_v03", "length": 21, "label": 2}, {"file_name": "a01_s09_e03_v03", "length": 26, "label": 1}, {"file_name": "a01_s01_e04_v03", "length": 28, "label": 1}, {"file_name": "a01_s07_e00_v03", "length": 28, "label": 1}, {"file_name": "a02_s03_e00_v03", "length": 46, "label": 2}, {"file_name": "a01_s02_e00_v03", "length": 21, "label": 1}, {"file_name": "a03_s09_e04_v03", "length": 21, "label": 3}, {"file_name": "a01_s06_e02_v03", "length": 26, "label": 1}, {"file_name": "a03_s07_e02_v03", "length": 17, "label": 3}, {"file_name": "a03_s05_e04_v03", "length": 39, "label": 3}, {"file_name": "a08_s07_e01_v03", "length": 126, "label": 7}, {"file_name": "a04_s07_e03_v03", "length": 26, "label": 4}, {"file_name": "a08_s04_e04_v03", "length": 56, "label": 7}, {"file_name": "a08_s08_e00_v03", "length": 68, "label": 7}, {"file_name": "a02_s09_e00_v03", "length": 37, "label": 2}, {"file_name": "a06_s03_e00_v03", "length": 16, "label": 6}, {"file_name": "a09_s09_e04_v03", "length": 68, "label": 8}, {"file_name": "a05_s04_e04_v03", "length": 21, "label": 5}, {"file_name": "a09_s04_e03_v03", "length": 31, "label": 8}, {"file_name": "a01_s09_e04_v03", "length": 28, "label": 1}, {"file_name": "a05_s10_e00_v03", "length": 33, "label": 5}, {"file_name": "a09_s08_e02_v03", "length": 49, "label": 8}, {"file_name": "a11_s07_e01_v03", "length": 20, "label": 9}, {"file_name": "a06_s01_e00_v03", "length": 21, "label": 6}, {"file_name": "a12_s08_e04_v03", "length": 14, "label": 10}, {"file_name": "a08_s09_e04_v03", "length": 75, "label": 7}, {"file_name": "a12_s10_e02_v03", "length": 21, "label": 10}, {"file_name": "a04_s01_e01_v03", "length": 33, "label": 4}, {"file_name": "a01_s08_e01_v03", "length": 21, "label": 1}, {"file_name": "a09_s07_e00_v03", "length": 41, "label": 8}, {"file_name": "a04_s09_e00_v03", "length": 21, "label": 4}, {"file_name": "a08_s02_e02_v03", "length": 111, "label": 7}, {"file_name": "a09_s09_e02_v03", "length": 81, "label": 8}, {"file_name": "a09_s02_e03_v03", "length": 31, "label": 8}, {"file_name": "a11_s09_e01_v03", "length": 16, "label": 9}, {"file_name": "a03_s10_e01_v03", "length": 11, "label": 3}, {"file_name": "a11_s03_e02_v03", "length": 21, "label": 9}, {"file_name": "a11_s08_e04_v03", "length": 19, "label": 9}, {"file_name": "a06_s08_e02_v03", "length": 11, "label": 6}, {"file_name": "a11_s04_e04_v03", "length": 21, "label": 9}, {"file_name": "a12_s01_e00_v03", "length": 18, "label": 10}, {"file_name": "a02_s06_e04_v03", "length": 21, "label": 2}, {"file_name": "a06_s07_e01_v03", "length": 16, "label": 6}, {"file_name": "a05_s10_e03_v03", "length": 26, "label": 5}, {"file_name": "a03_s06_e00_v03", "length": 23, "label": 3}, {"file_name": "a12_s02_e01_v03", "length": 21, "label": 10}, {"file_name": "a08_s10_e02_v03", "length": 76, "label": 7}, {"file_name": "a08_s02_e00_v03", "length": 86, "label": 7}, {"file_name": "a06_s10_e03_v03", "length": 21, "label": 6}, {"file_name": "a11_s04_e02_v03", "length": 21, "label": 9}, {"file_name": "a08_s09_e03_v03", "length": 121, "label": 7}, {"file_name": "a12_s06_e04_v03", "length": 16, "label": 10}, {"file_name": "a01_s07_e01_v03", "length": 26, "label": 1}, {"file_name": "a05_s02_e04_v03", "length": 26, "label": 5}, {"file_name": "a09_s08_e00_v03", "length": 52, "label": 8}, {"file_name": "a02_s04_e04_v03", "length": 33, "label": 2}, {"file_name": "a06_s07_e00_v03", "length": 8, "label": 6}, {"file_name": "a04_s09_e01_v03", "length": 34, "label": 4}, {"file_name": "a09_s01_e00_v03", "length": 41, "label": 8}, {"file_name": "a08_s10_e01_v03", "length": 111, "label": 7}, {"file_name": "a11_s10_e02_v03", "length": 61, "label": 9}, {"file_name": "a09_s10_e02_v03", "length": 49, "label": 8}, {"file_name": "a03_s07_e04_v03", "length": 11, "label": 3}, {"file_name": "a05_s08_e00_v03", "length": 26, "label": 5}, {"file_name": "a11_s09_e03_v03", "length": 15, "label": 9}, {"file_name": "a12_s04_e04_v03", "length": 14, "label": 10}, {"file_name": "a04_s01_e03_v03", "length": 16, "label": 4}, {"file_name": "a04_s10_e02_v03", "length": 16, "label": 4}, {"file_name": "a06_s10_e04_v03", "length": 16, "label": 6}, {"file_name": "a01_s08_e00_v03", "length": 21, "label": 1}, {"file_name": "a03_s10_e02_v03", "length": 28, "label": 3}, {"file_name": "a03_s07_e01_v03", "length": 11, "label": 3}, {"file_name": "a05_s04_e03_v03", "length": 21, "label": 5}, {"file_name": "a01_s01_e02_v03", "length": 25, "label": 1}, {"file_name": "a05_s10_e04_v03", "length": 19, "label": 5}, {"file_name": "a06_s08_e03_v03", "length": 21, "label": 6}, {"file_name": "a02_s04_e02_v03", "length": 33, "label": 2}, {"file_name": "a12_s01_e04_v03", "length": 15, "label": 10}, {"file_name": "a05_s07_e05_v03", "length": 18, "label": 5}, {"file_name": "a02_s01_e02_v03", "length": 28, "label": 2}, {"file_name": "a12_s10_e00_v03", "length": 21, "label": 10}, {"file_name": "a11_s02_e00_v03", "length": 31, "label": 9}, {"file_name": "a02_s09_e01_v03", "length": 40, "label": 2}, {"file_name": "a02_s04_e00_v03", "length": 46, "label": 2}, {"file_name": "a12_s01_e02_v03", "length": 14, "label": 10}, {"file_name": "a01_s03_e06_v03", "length": 31, "label": 1}, {"file_name": "a03_s01_e04_v03", "length": 36, "label": 3}, {"file_name": "a01_s03_e04_v03", "length": 34, "label": 1}, {"file_name": "a01_s06_e03_v03", "length": 21, "label": 1}, {"file_name": "a02_s06_e01_v03", "length": 16, "label": 2}, {"file_name": "a12_s07_e04_v03", "length": 21, "label": 10}, {"file_name": "a08_s10_e04_v03", "length": 86, "label": 7}, {"file_name": "a02_s03_e02_v03", "length": 58, "label": 2}, {"file_name": "a05_s06_e04_v03", "length": 18, "label": 5}, {"file_name": "a05_s10_e01_v03", "length": 26, "label": 5}, {"file_name": "a09_s10_e01_v03", "length": 55, "label": 8}, {"file_name": "a08_s08_e04_v03", "length": 61, "label": 7}, {"file_name": "a06_s01_e02_v03", "length": 21, "label": 6}, {"file_name": "a01_s01_e01_v03", "length": 21, "label": 1}, {"file_name": "a06_s08_e04_v03", "length": 17, "label": 6}, {"file_name": "a09_s06_e03_v03", "length": 56, "label": 8}, {"file_name": "a06_s09_e01_v03", "length": 21, "label": 6}, {"file_name": "a08_s06_e01_v03", "length": 134, "label": 7}, {"file_name": "a02_s01_e04_v03", "length": 38, "label": 2}, {"file_name": "a11_s01_e00_v03", "length": 14, "label": 9}, {"file_name": "a03_s03_e00_v03", "length": 41, "label": 3}, {"file_name": "a01_s04_e04_v03", "length": 21, "label": 1}, {"file_name": "a06_s01_e04_v03", "length": 16, "label": 6}, {"file_name": "a01_s10_e01_v03", "length": 24, "label": 1}, {"file_name": "a03_s09_e00_v03", "length": 26, "label": 3}, {"file_name": "a08_s10_e00_v03", "length": 71, "label": 7}, {"file_name": "a05_s10_e02_v03", "length": 34, "label": 5}, {"file_name": "a04_s10_e01_v03", "length": 16, "label": 4}, {"file_name": "a05_s03_e04_v03", "length": 14, "label": 5}, {"file_name": "a05_s07_e02_v03", "length": 26, "label": 5}, {"file_name": "a12_s02_e04_v03", "length": 16, "label": 10}, {"file_name": "a06_s02_e03_v03", "length": 17, "label": 6}, {"file_name": "a09_s01_e03_v03", "length": 41, "label": 8}, {"file_name": "a08_s04_e00_v03", "length": 49, "label": 7}, {"file_name": "a02_s10_e01_v03", "length": 32, "label": 2}, {"file_name": "a11_s04_e01_v03", "length": 21, "label": 9}, {"file_name": "a03_s05_e01_v03", "length": 39, "label": 3}, {"file_name": "a06_s07_e04_v03", "length": 21, "label": 6}, {"file_name": "a09_s09_e03_v03", "length": 56, "label": 8}, {"file_name": "a02_s06_e02_v03", "length": 21, "label": 2}, {"file_name": "a05_s01_e04_v03", "length": 21, "label": 5}, {"file_name": "a11_s03_e04_v03", "length": 26, "label": 9}, {"file_name": "a04_s08_e02_v03", "length": 21, "label": 4}, {"file_name": "a04_s09_e04_v03", "length": 21, "label": 4}, {"file_name": "a08_s07_e00_v03", "length": 51, "label": 7}, {"file_name": "a04_s01_e05_v03", "length": 16, "label": 4}, {"file_name": "a12_s07_e01_v03", "length": 16, "label": 10}, {"file_name": "a02_s01_e03_v03", "length": 40, "label": 2}, {"file_name": "a09_s04_e00_v03", "length": 35, "label": 8}, {"file_name": "a09_s01_e04_v03", "length": 37, "label": 8}, {"file_name": "a12_s08_e00_v03", "length": 16, "label": 10}, {"file_name": "a04_s06_e03_v03", "length": 16, "label": 4}, {"file_name": "a11_s06_e01_v03", "length": 21, "label": 9}, {"file_name": "a01_s10_e02_v03", "length": 26, "label": 1}, {"file_name": "a02_s10_e04_v03", "length": 29, "label": 2}, {"file_name": "a04_s07_e01_v03", "length": 21, "label": 4}, {"file_name": "a03_s04_e01_v03", "length": 39, "label": 3}, {"file_name": "a03_s01_e02_v03", "length": 31, "label": 3}, {"file_name": "a06_s09_e02_v03", "length": 26, "label": 6}, {"file_name": "a03_s07_e00_v03", "length": 21, "label": 3}, {"file_name": "a06_s04_e02_v03", "length": 21, "label": 6}, {"file_name": "a12_s04_e01_v03", "length": 16, "label": 10}, {"file_name": "a04_s06_e02_v03", "length": 21, "label": 4}, {"file_name": "a04_s04_e04_v03", "length": 21, "label": 4}, {"file_name": "a09_s04_e02_v03", "length": 37, "label": 8}, {"file_name": "a02_s02_e01_v03", "length": 26, "label": 2}, {"file_name": "a06_s09_e00_v03", "length": 21, "label": 6}, {"file_name": "a05_s09_e00_v03", "length": 28, "label": 5}, {"file_name": "a05_s03_e01_v03", "length": 17, "label": 5}, {"file_name": "a02_s05_e04_v03", "length": 29, "label": 2}, {"file_name": "a01_s06_e01_v03", "length": 21, "label": 1}, {"file_name": "a12_s04_e02_v03", "length": 13, "label": 10}, {"file_name": "a03_s05_e02_v03", "length": 36, "label": 3}, {"file_name": "a01_s03_e02_v03", "length": 37, "label": 1}, {"file_name": "a05_s08_e05_v03", "length": 21, "label": 5}, {"file_name": "a01_s03_e00_v03", "length": 29, "label": 1}, {"file_name": "a08_s06_e03_v03", "length": 120, "label": 7}, {"file_name": "a05_s09_e02_v03", "length": 26, "label": 5}, {"file_name": "a01_s02_e01_v03", "length": 27, "label": 1}, {"file_name": "a01_s03_e01_v03", "length": 33, "label": 1}, {"file_name": "a04_s03_e01_v03", "length": 16, "label": 4}, {"file_name": "a06_s06_e00_v03", "length": 21, "label": 6}, {"file_name": "a12_s06_e02_v03", "length": 18, "label": 10}, {"file_name": "a11_s03_e05_v03", "length": 26, "label": 9}, {"file_name": "a04_s10_e04_v03", "length": 16, "label": 4}, {"file_name": "a12_s03_e01_v03", "length": 11, "label": 10}, {"file_name": "a08_s04_e02_v03", "length": 67, "label": 7}, {"file_name": "a06_s04_e04_v03", "length": 13, "label": 6}, {"file_name": "a12_s06_e03_v03", "length": 17, "label": 10}, {"file_name": "a08_s01_e04_v03", "length": 71, "label": 7}, {"file_name": "a04_s03_e00_v03", "length": 14, "label": 4}, {"file_name": "a08_s01_e00_v03", "length": 51, "label": 7}, {"file_name": "a01_s03_e03_v03", "length": 41, "label": 1}, {"file_name": "a04_s01_e08_v03", "length": 16, "label": 4}, {"file_name": "a01_s04_e02_v03", "length": 26, "label": 1}, {"file_name": "a01_s10_e04_v03", "length": 26, "label": 1}, {"file_name": "a09_s02_e00_v03", "length": 41, "label": 8}, {"file_name": "a06_s07_e02_v03", "length": 16, "label": 6}, {"file_name": "a08_s07_e02_v03", "length": 46, "label": 7}, {"file_name": "a11_s10_e01_v03", "length": 36, "label": 9}, {"file_name": "a02_s07_e00_v03", "length": 31, "label": 2}, {"file_name": "a06_s08_e01_v03", "length": 16, "label": 6}, {"file_name": "a01_s10_e03_v03", "length": 31, "label": 1}, {"file_name": "a11_s02_e04_v03", "length": 35, "label": 9}, {"file_name": "a02_s09_e04_v03", "length": 1, "label": 2}, {"file_name": "a12_s03_e03_v03", "length": 21, "label": 10}, {"file_name": "a05_s01_e01_v03", "length": 21, "label": 5}, {"file_name": "a05_s08_e02_v03", "length": 16, "label": 5}, {"file_name": "a12_s09_e02_v03", "length": 23, "label": 10}, {"file_name": "a09_s08_e01_v03", "length": 48, "label": 8}, {"file_name": "a01_s08_e04_v03", "length": 23, "label": 1}, {"file_name": "a09_s09_e00_v03", "length": 56, "label": 8}, {"file_name": "a03_s10_e03_v03", "length": 13, "label": 3}, {"file_name": "a09_s02_e04_v03", "length": 36, "label": 8}, {"file_name": "a08_s01_e01_v03", "length": 61, "label": 7}, {"file_name": "a09_s10_e00_v03", "length": 54, "label": 8}, {"file_name": "a12_s09_e01_v03", "length": 18, "label": 10}, {"file_name": "a05_s01_e00_v03", "length": 20, "label": 5}, {"file_name": "a06_s02_e01_v03", "length": 16, "label": 6}, {"file_name": "a08_s08_e03_v03", "length": 62, "label": 7}, {"file_name": "a04_s04_e03_v03", "length": 21, "label": 4}, {"file_name": "a02_s10_e02_v03", "length": 31, "label": 2}, {"file_name": "a01_s03_e05_v03", "length": 31, "label": 1}, {"file_name": "a06_s03_e03_v03", "length": 19, "label": 6}, {"file_name": "a05_s07_e04_v03", "length": 21, "label": 5}, {"file_name": "a02_s10_e00_v03", "length": 38, "label": 2}, {"file_name": "a12_s04_e00_v03", "length": 16, "label": 10}, {"file_name": "a03_s04_e02_v03", "length": 27, "label": 3}, {"file_name": "a06_s02_e02_v03", "length": 21, "label": 6}, {"file_name": "a03_s04_e03_v03", "length": 31, "label": 3}, {"file_name": "a11_s08_e03_v03", "length": 12, "label": 9}, {"file_name": "a09_s07_e03_v03", "length": 44, "label": 8}, {"file_name": "a05_s03_e03_v03", "length": 14, "label": 5}, {"file_name": "a09_s10_e03_v03", "length": 54, "label": 8}, {"file_name": "a11_s06_e02_v03", "length": 18, "label": 9}, {"file_name": "a04_s04_e02_v03", "length": 11, "label": 4}, {"file_name": "a11_s08_e02_v03", "length": 21, "label": 9}, {"file_name": "a11_s07_e03_v03", "length": 21, "label": 9}, {"file_name": "a04_s01_e06_v03", "length": 19, "label": 4}, {"file_name": "a06_s01_e01_v03", "length": 21, "label": 6}, {"file_name": "a12_s06_e00_v03", "length": 11, "label": 10}, {"file_name": "a12_s03_e02_v03", "length": 18, "label": 10}, {"file_name": "a03_s04_e00_v03", "length": 26, "label": 3}, {"file_name": "a11_s01_e03_v03", "length": 18, "label": 9}, {"file_name": "a03_s08_e01_v03", "length": 21, "label": 3}, {"file_name": "a11_s04_e00_v03", "length": 31, "label": 9}, {"file_name": "a02_s05_e02_v03", "length": 26, "label": 2}, {"file_name": "a06_s06_e01_v03", "length": 19, "label": 6}, {"file_name": "a03_s03_e02_v03", "length": 32, "label": 3}, {"file_name": "a11_s07_e02_v03", "length": 16, "label": 9}, {"file_name": "a11_s01_e02_v03", "length": 15, "label": 9}]
+        else:
+            self.train_val_flag = 'train'
+            self.data_dict_raw = [{"file_name": "a05_s04_e02_v01", "length": 26, "label": 5}, {"file_name": "a01_s05_e04_v01", "length": 46, "label": 1}, {"file_name": "a03_s03_e04_v01", "length": 42, "label": 3}, {"file_name": "a08_s02_e01_v01", "length": 106, "label": 7}, {"file_name": "a03_s05_e03_v01", "length": 31, "label": 3}, {"file_name": "a06_s05_e01_v01", "length": 20, "label": 6}, {"file_name": "a12_s10_e01_v01", "length": 37, "label": 10}, {"file_name": "a01_s07_e03_v01", "length": 39, "label": 1}, {"file_name": "a03_s08_e02_v01", "length": 61, "label": 3}, {"file_name": "a11_s10_e03_v01", "length": 49, "label": 9}, {"file_name": "a11_s03_e00_v01", "length": 41, "label": 9}, {"file_name": "a03_s02_e00_v01", "length": 31, "label": 3}, {"file_name": "a11_s01_e04_v01", "length": 21, "label": 9}, {"file_name": "a04_s05_e04_v01", "length": 49, "label": 4}, {"file_name": "a09_s08_e04_v01", "length": 76, "label": 8}, {"file_name": "a09_s06_e01_v01", "length": 41, "label": 8}, {"file_name": "a09_s07_e01_v01", "length": 77, "label": 8}, {"file_name": "a02_s08_e01_v01", "length": 21, "label": 2}, {"file_name": "a01_s04_e01_v01", "length": 41, "label": 1}, {"file_name": "a02_s02_e02_v01", "length": 53, "label": 2}, {"file_name": "a02_s07_e05_v01", "length": 39, "label": 2}, {"file_name": "a06_s02_e00_v01", "length": 34, "label": 6}, {"file_name": "a03_s02_e02_v01", "length": 26, "label": 3}, {"file_name": "a09_s03_e04_v01", "length": 75, "label": 8}, {"file_name": "a04_s01_e02_v01", "length": 44, "label": 4}, {"file_name": "a12_s01_e01_v01", "length": 45, "label": 10}, {"file_name": "a02_s07_e03_v01", "length": 53, "label": 2}, {"file_name": "a05_s08_e04_v01", "length": 19, "label": 5}, {"file_name": "a02_s07_e02_v01", "length": 35, "label": 2}, {"file_name": "a04_s07_e02_v01", "length": 78, "label": 4}, {"file_name": "a01_s08_e03_v01", "length": 64, "label": 1}, {"file_name": "a08_s03_e01_v01", "length": 86, "label": 7}, {"file_name": "a04_s08_e03_v01", "length": 79, "label": 4}, {"file_name": "a03_s10_e00_v01", "length": 52, "label": 3}, {"file_name": "a04_s03_e03_v01", "length": 76, "label": 4}, {"file_name": "a11_s05_e02_v01", "length": 20, "label": 9}, {"file_name": "a06_s06_e02_v01", "length": 21, "label": 6}, {"file_name": "a01_s08_e06_v01", "length": 27, "label": 1}, {"file_name": "a03_s09_e03_v01", "length": 29, "label": 3}, {"file_name": "a09_s03_e00_v01", "length": 105, "label": 8}, {"file_name": "a09_s03_e03_v01", "length": 49, "label": 8}, {"file_name": "a04_s02_e02_v01", "length": 120, "label": 4}, {"file_name": "a08_s01_e02_v01", "length": 84, "label": 7}, {"file_name": "a04_s04_e00_v01", "length": 30, "label": 4}, {"file_name": "a03_s02_e03_v01", "length": 50, "label": 3}, {"file_name": "a05_s04_e00_v01", "length": 49, "label": 5}, {"file_name": "a05_s07_e03_v01", "length": 34, "label": 5}, {"file_name": "a02_s10_e05_v01", "length": 51, "label": 2}, {"file_name": "a06_s10_e00_v01", "length": 35, "label": 6}, {"file_name": "a11_s07_e00_v01", "length": 26, "label": 9}, {"file_name": "a03_s01_e01_v01", "length": 131, "label": 3}, {"file_name": "a04_s06_e01_v01", "length": 35, "label": 4}, {"file_name": "a08_s02_e04_v01", "length": 106, "label": 7}, {"file_name": "a09_s08_e03_v01", "length": 85, "label": 8}, {"file_name": "a05_s02_e02_v01", "length": 19, "label": 5}, {"file_name": "a04_s06_e04_v01", "length": 23, "label": 4}, {"file_name": "a05_s09_e03_v01", "length": 38, "label": 5}, {"file_name": "a03_s06_e02_v01", "length": 23, "label": 3}, {"file_name": "a01_s01_e00_v01", "length": 44, "label": 1}, {"file_name": "a06_s06_e03_v01", "length": 28, "label": 6}, {"file_name": "a06_s10_e02_v01", "length": 35, "label": 6}, {"file_name": "a02_s07_e04_v01", "length": 45, "label": 2}, {"file_name": "a09_s06_e00_v01", "length": 80, "label": 8}, {"file_name": "a04_s07_e04_v01", "length": 89, "label": 4}, {"file_name": "a04_s05_e09_v01", "length": 38, "label": 4}, {"file_name": "a05_s02_e01_v01", "length": 17, "label": 5}, {"file_name": "a01_s06_e04_v01", "length": 24, "label": 1}, {"file_name": "a04_s08_e01_v01", "length": 77, "label": 4}, {"file_name": "a01_s09_e00_v01", "length": 37, "label": 1}, {"file_name": "a08_s03_e03_v01", "length": 157, "label": 7}, {"file_name": "a12_s03_e00_v01", "length": 31, "label": 10}, {"file_name": "a11_s02_e03_v01", "length": 29, "label": 9}, {"file_name": "a12_s07_e02_v01", "length": 25, "label": 10}, {"file_name": "a11_s05_e01_v01", "length": 53, "label": 9}, {"file_name": "a05_s06_e01_v01", "length": 18, "label": 5}, {"file_name": "a03_s08_e06_v01", "length": 25, "label": 3}, {"file_name": "a06_s02_e04_v01", "length": 32, "label": 6}, {"file_name": "a06_s04_e00_v01", "length": 49, "label": 6}, {"file_name": "a05_s09_e01_v01", "length": 33, "label": 5}, {"file_name": "a11_s05_e03_v01", "length": 41, "label": 9}, {"file_name": "a11_s10_e04_v01", "length": 55, "label": 9}, {"file_name": "a03_s01_e00_v01", "length": 106, "label": 3}, {"file_name": "a03_s08_e04_v01", "length": 31, "label": 3}, {"file_name": "a11_s02_e01_v01", "length": 8, "label": 9}, {"file_name": "a04_s02_e00_v01", "length": 25, "label": 4}, {"file_name": "a11_s01_e01_v01", "length": 31, "label": 9}, {"file_name": "a02_s06_e03_v01", "length": 35, "label": 2}, {"file_name": "a12_s10_e03_v01", "length": 40, "label": 10}, {"file_name": "a01_s05_e02_v01", "length": 51, "label": 1}, {"file_name": "a01_s06_e00_v01", "length": 36, "label": 1}, {"file_name": "a05_s07_e01_v01", "length": 35, "label": 5}, {"file_name": "a01_s09_e01_v01", "length": 38, "label": 1}, {"file_name": "a02_s06_e00_v01", "length": 32, "label": 2}, {"file_name": "a11_s09_e00_v01", "length": 12, "label": 9}, {"file_name": "a03_s03_e01_v01", "length": 33, "label": 3}, {"file_name": "a03_s08_e00_v01", "length": 42, "label": 3}, {"file_name": "a06_s04_e01_v01", "length": 31, "label": 6}, {"file_name": "a02_s05_e01_v01", "length": 58, "label": 2}, {"file_name": "a03_s04_e04_v01", "length": 36, "label": 3}, {"file_name": "a01_s09_e02_v01", "length": 32, "label": 1}, {"file_name": "a08_s03_e04_v01", "length": 51, "label": 7}, {"file_name": "a01_s10_e00_v01", "length": 36, "label": 1}, {"file_name": "a01_s02_e02_v01", "length": 33, "label": 1}, {"file_name": "a09_s03_e01_v01", "length": 61, "label": 8}, {"file_name": "a05_s06_e00_v01", "length": 39, "label": 5}, {"file_name": "a05_s01_e02_v01", "length": 26, "label": 5}, {"file_name": "a03_s06_e04_v01", "length": 24, "label": 3}, {"file_name": "a02_s02_e04_v01", "length": 36, "label": 2}, {"file_name": "a06_s07_e03_v01", "length": 32, "label": 6}, {"file_name": "a04_s02_e04_v01", "length": 28, "label": 4}, {"file_name": "a04_s05_e02_v01", "length": 75, "label": 4}, {"file_name": "a02_s07_e01_v01", "length": 38, "label": 2}, {"file_name": "a03_s07_e03_v01", "length": 62, "label": 3}, {"file_name": "a12_s08_e01_v01", "length": 32, "label": 10}, {"file_name": "a05_s01_e03_v01", "length": 31, "label": 5}, {"file_name": "a02_s09_e02_v01", "length": 60, "label": 2}, {"file_name": "a05_s08_e03_v01", "length": 29, "label": 5}, {"file_name": "a04_s06_e00_v01", "length": 67, "label": 4}, {"file_name": "a09_s01_e02_v01", "length": 130, "label": 8}, {"file_name": "a04_s09_e02_v01", "length": 68, "label": 4}, {"file_name": "a03_s03_e03_v01", "length": 36, "label": 3}, {"file_name": "a08_s07_e03_v01", "length": 86, "label": 7}, {"file_name": "a08_s09_e02_v01", "length": 148, "label": 7}, {"file_name": "a08_s09_e00_v01", "length": 120, "label": 7}, {"file_name": "a06_s06_e04_v01", "length": 30, "label": 6}, {"file_name": "a01_s07_e04_v01", "length": 34, "label": 1}, {"file_name": "a04_s05_e08_v01", "length": 28, "label": 4}, {"file_name": "a08_s05_e04_v01", "length": 80, "label": 7}, {"file_name": "a05_s04_e01_v01", "length": 30, "label": 5}, {"file_name": "a04_s07_e00_v01", "length": 117, "label": 4}, {"file_name": "a05_s08_e01_v01", "length": 35, "label": 5}, {"file_name": "a11_s06_e03_v01", "length": 22, "label": 9}, {"file_name": "a01_s04_e03_v01", "length": 58, "label": 1}, {"file_name": "a12_s07_e03_v01", "length": 21, "label": 10}, {"file_name": "a01_s02_e04_v01", "length": 19, "label": 1}, {"file_name": "a04_s04_e05_v01", "length": 34, "label": 4}, {"file_name": "a03_s01_e03_v01", "length": 113, "label": 3}, {"file_name": "a12_s02_e02_v01", "length": 63, "label": 10}, {"file_name": "a05_s02_e03_v01", "length": 26, "label": 5}, {"file_name": "a03_s02_e04_v01", "length": 33, "label": 3}, {"file_name": "a08_s02_e03_v01", "length": 100, "label": 7}, {"file_name": "a08_s03_e02_v01", "length": 83, "label": 7}, {"file_name": "a09_s01_e01_v01", "length": 106, "label": 8}, {"file_name": "a02_s01_e01_v01", "length": 59, "label": 2}, {"file_name": "a08_s06_e00_v01", "length": 103, "label": 7}, {"file_name": "a04_s04_e09_v01", "length": 36, "label": 4}, {"file_name": "a12_s08_e02_v01", "length": 29, "label": 10}, {"file_name": "a02_s08_e00_v01", "length": 27, "label": 2}, {"file_name": "a01_s08_e02_v01", "length": 201, "label": 1}, {"file_name": "a09_s04_e01_v01", "length": 74, "label": 8}, {"file_name": "a04_s01_e04_v01", "length": 120, "label": 4}, {"file_name": "a04_s05_e03_v01", "length": 31, "label": 4}, {"file_name": "a08_s10_e03_v01", "length": 70, "label": 7}, {"file_name": "a02_s05_e00_v01", "length": 26, "label": 2}, {"file_name": "a06_s04_e03_v01", "length": 19, "label": 6}, {"file_name": "a06_s09_e03_v01", "length": 44, "label": 6}, {"file_name": "a05_s03_e02_v01", "length": 40, "label": 5}, {"file_name": "a06_s03_e04_v01", "length": 30, "label": 6}, {"file_name": "a06_s01_e03_v01", "length": 26, "label": 6}, {"file_name": "a11_s03_e01_v01", "length": 31, "label": 9}, {"file_name": "a09_s02_e01_v01", "length": 67, "label": 8}, {"file_name": "a02_s02_e00_v01", "length": 57, "label": 2}, {"file_name": "a01_s01_e03_v01", "length": 51, "label": 1}, {"file_name": "a08_s06_e02_v01", "length": 90, "label": 7}, {"file_name": "a12_s01_e03_v01", "length": 57, "label": 10}, {"file_name": "a06_s05_e04_v01", "length": 15, "label": 6}, {"file_name": "a09_s09_e01_v01", "length": 179, "label": 8}, {"file_name": "a04_s10_e03_v01", "length": 20, "label": 4}, {"file_name": "a06_s09_e04_v01", "length": 35, "label": 6}, {"file_name": "a02_s04_e01_v01", "length": 55, "label": 2}, {"file_name": "a12_s10_e04_v01", "length": 57, "label": 10}, {"file_name": "a04_s03_e05_v01", "length": 44, "label": 4}, {"file_name": "a06_s03_e01_v01", "length": 31, "label": 6}, {"file_name": "a02_s03_e04_v01", "length": 51, "label": 2}, {"file_name": "a11_s09_e02_v01", "length": 42, "label": 9}, {"file_name": "a08_s08_e02_v01", "length": 61, "label": 7}, {"file_name": "a03_s02_e01_v01", "length": 28, "label": 3}, {"file_name": "a12_s02_e00_v01", "length": 38, "label": 10}, {"file_name": "a12_s08_e03_v01", "length": 26, "label": 10}, {"file_name": "a02_s09_e03_v01", "length": 45, "label": 2}, {"file_name": "a09_s02_e02_v01", "length": 54, "label": 8}, {"file_name": "a05_s09_e04_v01", "length": 39, "label": 5}, {"file_name": "a04_s04_e06_v01", "length": 28, "label": 4}, {"file_name": "a01_s04_e00_v01", "length": 21, "label": 1}, {"file_name": "a08_s04_e03_v01", "length": 125, "label": 7}, {"file_name": "a08_s05_e01_v01", "length": 135, "label": 7}, {"file_name": "a02_s04_e03_v01", "length": 28, "label": 2}, {"file_name": "a04_s03_e04_v01", "length": 51, "label": 4}, {"file_name": "a12_s06_e01_v01", "length": 21, "label": 10}, {"file_name": "a11_s04_e03_v01", "length": 51, "label": 9}, {"file_name": "a05_s03_e00_v01", "length": 46, "label": 5}, {"file_name": "a12_s07_e00_v01", "length": 34, "label": 10}, {"file_name": "a06_s03_e02_v01", "length": 70, "label": 6}, {"file_name": "a03_s03_e05_v01", "length": 30, "label": 3}, {"file_name": "a11_s08_e01_v01", "length": 19, "label": 9}, {"file_name": "a05_s05_e04_v01", "length": 26, "label": 5}, {"file_name": "a06_s10_e01_v01", "length": 30, "label": 6}, {"file_name": "a04_s03_e02_v01", "length": 97, "label": 4}, {"file_name": "a02_s03_e03_v01", "length": 56, "label": 2}, {"file_name": "a09_s10_e04_v01", "length": 66, "label": 8}, {"file_name": "a04_s08_e04_v01", "length": 71, "label": 4}, {"file_name": "a11_s08_e00_v01", "length": 14, "label": 9}, {"file_name": "a02_s01_e00_v01", "length": 55, "label": 2}, {"file_name": "a04_s02_e03_v01", "length": 51, "label": 4}, {"file_name": "a04_s02_e01_v01", "length": 48, "label": 4}, {"file_name": "a06_s08_e00_v01", "length": 15, "label": 6}, {"file_name": "a08_s08_e01_v01", "length": 90, "label": 7}, {"file_name": "a02_s03_e01_v01", "length": 50, "label": 2}, {"file_name": "a11_s02_e02_v01", "length": 35, "label": 9}, {"file_name": "a09_s07_e02_v01", "length": 44, "label": 8}, {"file_name": "a02_s05_e03_v01", "length": 41, "label": 2}, {"file_name": "a01_s07_e02_v01", "length": 35, "label": 1}, {"file_name": "a06_s05_e03_v01", "length": 18, "label": 6}, {"file_name": "a12_s05_e03_v01", "length": 40, "label": 10}, {"file_name": "a03_s05_e00_v01", "length": 63, "label": 3}, {"file_name": "a09_s03_e02_v01", "length": 48, "label": 8}, {"file_name": "a09_s04_e04_v01", "length": 139, "label": 8}, {"file_name": "a11_s10_e00_v01", "length": 50, "label": 9}, {"file_name": "a04_s04_e01_v01", "length": 26, "label": 4}, {"file_name": "a01_s08_e05_v01", "length": 63, "label": 1}, {"file_name": "a02_s08_e02_v01", "length": 35, "label": 2}, {"file_name": "a01_s05_e00_v01", "length": 83, "label": 1}, {"file_name": "a11_s06_e00_v01", "length": 33, "label": 9}, {"file_name": "a05_s02_e00_v01", "length": 40, "label": 5}, {"file_name": "a02_s02_e03_v01", "length": 41, "label": 2}, {"file_name": "a09_s05_e02_v01", "length": 61, "label": 8}, {"file_name": "a05_s06_e02_v01", "length": 19, "label": 5}, {"file_name": "a08_s01_e03_v01", "length": 130, "label": 7}, {"file_name": "a08_s09_e01_v01", "length": 153, "label": 7}, {"file_name": "a02_s08_e04_v01", "length": 51, "label": 2}, {"file_name": "a06_s05_e02_v01", "length": 21, "label": 6}, {"file_name": "a01_s02_e03_v01", "length": 31, "label": 1}, {"file_name": "a11_s08_e05_v01", "length": 34, "label": 9}, {"file_name": "a03_s09_e02_v01", "length": 19, "label": 3}, {"file_name": "a04_s08_e00_v01", "length": 86, "label": 4}, {"file_name": "a03_s09_e01_v01", "length": 6, "label": 3}, {"file_name": "a08_s04_e01_v01", "length": 109, "label": 7}, {"file_name": "a12_s04_e03_v01", "length": 41, "label": 10}, {"file_name": "a04_s09_e03_v01", "length": 43, "label": 4}, {"file_name": "a12_s05_e00_v01", "length": 32, "label": 10}, {"file_name": "a11_s05_e04_v01", "length": 41, "label": 9}, {"file_name": "a05_s06_e03_v01", "length": 19, "label": 5}, {"file_name": "a09_s06_e02_v01", "length": 31, "label": 8}, {"file_name": "a06_s08_e05_v01", "length": 19, "label": 6}, {"file_name": "a03_s06_e03_v01", "length": 25, "label": 3}, {"file_name": "a12_s02_e03_v01", "length": 77, "label": 10}, {"file_name": "a11_s03_e03_v01", "length": 36, "label": 9}, {"file_name": "a04_s01_e00_v01", "length": 141, "label": 4}, {"file_name": "a04_s04_e08_v01", "length": 36, "label": 4}, {"file_name": "a03_s08_e03_v01", "length": 31, "label": 3}, {"file_name": "a02_s10_e03_v01", "length": 71, "label": 2}, {"file_name": "a04_s10_e00_v01", "length": 12, "label": 4}, {"file_name": "a08_s03_e00_v01", "length": 84, "label": 7}, {"file_name": "a02_s08_e03_v01", "length": 56, "label": 2}, {"file_name": "a01_s09_e03_v01", "length": 35, "label": 1}, {"file_name": "a01_s01_e04_v01", "length": 46, "label": 1}, {"file_name": "a01_s07_e00_v01", "length": 35, "label": 1}, {"file_name": "a02_s03_e00_v01", "length": 86, "label": 2}, {"file_name": "a01_s02_e00_v01", "length": 25, "label": 1}, {"file_name": "a03_s09_e04_v01", "length": 38, "label": 3}, {"file_name": "a01_s06_e02_v01", "length": 28, "label": 1}, {"file_name": "a03_s07_e02_v01", "length": 8, "label": 3}, {"file_name": "a04_s05_e05_v01", "length": 56, "label": 4}, {"file_name": "a08_s07_e01_v01", "length": 155, "label": 7}, {"file_name": "a04_s07_e03_v01", "length": 109, "label": 4}, {"file_name": "a08_s04_e04_v01", "length": 146, "label": 7}, {"file_name": "a08_s08_e00_v01", "length": 56, "label": 7}, {"file_name": "a02_s09_e00_v01", "length": 55, "label": 2}, {"file_name": "a06_s03_e00_v01", "length": 35, "label": 6}, {"file_name": "a04_s05_e07_v01", "length": 39, "label": 4}, {"file_name": "a09_s09_e04_v01", "length": 81, "label": 8}, {"file_name": "a05_s04_e04_v01", "length": 27, "label": 5}, {"file_name": "a09_s04_e03_v01", "length": 63, "label": 8}, {"file_name": "a01_s09_e04_v01", "length": 25, "label": 1}, {"file_name": "a05_s10_e00_v01", "length": 59, "label": 5}, {"file_name": "a09_s08_e02_v01", "length": 100, "label": 8}, {"file_name": "a11_s07_e01_v01", "length": 10, "label": 9}, {"file_name": "a06_s01_e00_v01", "length": 32, "label": 6}, {"file_name": "a12_s08_e04_v01", "length": 26, "label": 10}, {"file_name": "a08_s09_e04_v01", "length": 88, "label": 7}, {"file_name": "a12_s10_e02_v01", "length": 66, "label": 10}, {"file_name": "a04_s01_e01_v01", "length": 84, "label": 4}, {"file_name": "a01_s08_e01_v01", "length": 19, "label": 1}, {"file_name": "a09_s07_e00_v01", "length": 63, "label": 8}, {"file_name": "a04_s09_e00_v01", "length": 112, "label": 4}, {"file_name": "a08_s02_e02_v01", "length": 163, "label": 7}, {"file_name": "a09_s09_e02_v01", "length": 192, "label": 8}, {"file_name": "a09_s02_e03_v01", "length": 66, "label": 8}, {"file_name": "a11_s09_e01_v01", "length": 26, "label": 9}, {"file_name": "a03_s10_e01_v01", "length": 31, "label": 3}, {"file_name": "a11_s03_e02_v01", "length": 21, "label": 9}, {"file_name": "a11_s08_e04_v01", "length": 65, "label": 9}, {"file_name": "a06_s08_e02_v01", "length": 20, "label": 6}, {"file_name": "a11_s04_e04_v01", "length": 51, "label": 9}, {"file_name": "a12_s01_e00_v01", "length": 62, "label": 10}, {"file_name": "a02_s06_e04_v01", "length": 25, "label": 2}, {"file_name": "a06_s07_e01_v01", "length": 29, "label": 6}, {"file_name": "a05_s10_e03_v01", "length": 46, "label": 5}, {"file_name": "a09_s05_e04_v01", "length": 60, "label": 8}, {"file_name": "a03_s06_e00_v01", "length": 28, "label": 3}, {"file_name": "a12_s02_e01_v01", "length": 45, "label": 10}, {"file_name": "a08_s10_e02_v01", "length": 102, "label": 7}, {"file_name": "a08_s02_e00_v01", "length": 116, "label": 7}, {"file_name": "a06_s10_e03_v01", "length": 37, "label": 6}, {"file_name": "a11_s04_e02_v01", "length": 37, "label": 9}, {"file_name": "a08_s09_e03_v01", "length": 125, "label": 7}, {"file_name": "a12_s06_e04_v01", "length": 18, "label": 10}, {"file_name": "a01_s07_e01_v01", "length": 31, "label": 1}, {"file_name": "a05_s02_e04_v01", "length": 21, "label": 5}, {"file_name": "a09_s08_e00_v01", "length": 71, "label": 8}, {"file_name": "a02_s04_e04_v01", "length": 44, "label": 2}, {"file_name": "a06_s07_e00_v01", "length": 20, "label": 6}, {"file_name": "a04_s09_e01_v01", "length": 79, "label": 4}, {"file_name": "a09_s01_e00_v01", "length": 97, "label": 8}, {"file_name": "a08_s10_e01_v01", "length": 100, "label": 7}, {"file_name": "a11_s10_e02_v01", "length": 22, "label": 9}, {"file_name": "a09_s10_e02_v01", "length": 40, "label": 8}, {"file_name": "a03_s07_e04_v01", "length": 28, "label": 3}, {"file_name": "a05_s08_e00_v01", "length": 31, "label": 5}, {"file_name": "a05_s05_e03_v01", "length": 21, "label": 5}, {"file_name": "a11_s09_e03_v01", "length": 19, "label": 9}, {"file_name": "a12_s04_e04_v01", "length": 37, "label": 10}, {"file_name": "a04_s01_e03_v01", "length": 84, "label": 4}, {"file_name": "a04_s10_e02_v01", "length": 35, "label": 4}, {"file_name": "a06_s10_e04_v01", "length": 42, "label": 6}, {"file_name": "a01_s08_e00_v01", "length": 42, "label": 1}, {"file_name": "a03_s10_e02_v01", "length": 60, "label": 3}, {"file_name": "a03_s07_e01_v01", "length": 18, "label": 3}, {"file_name": "a05_s04_e03_v01", "length": 27, "label": 5}, {"file_name": "a01_s01_e02_v01", "length": 64, "label": 1}, {"file_name": "a05_s10_e04_v01", "length": 29, "label": 5}, {"file_name": "a06_s08_e03_v01", "length": 24, "label": 6}, {"file_name": "a02_s04_e02_v01", "length": 29, "label": 2}, {"file_name": "a12_s01_e04_v01", "length": 61, "label": 10}, {"file_name": "a02_s01_e02_v01", "length": 69, "label": 2}, {"file_name": "a12_s10_e00_v01", "length": 31, "label": 10}, {"file_name": "a11_s02_e00_v01", "length": 25, "label": 9}, {"file_name": "a02_s09_e01_v01", "length": 38, "label": 2}, {"file_name": "a12_s06_e05_v01", "length": 43, "label": 10}, {"file_name": "a02_s04_e00_v01", "length": 51, "label": 2}, {"file_name": "a12_s01_e02_v01", "length": 58, "label": 10}, {"file_name": "a04_s02_e05_v01", "length": 57, "label": 4}, {"file_name": "a03_s01_e04_v01", "length": 69, "label": 3}, {"file_name": "a01_s03_e04_v01", "length": 54, "label": 1}, {"file_name": "a01_s06_e03_v01", "length": 21, "label": 1}, {"file_name": "a02_s06_e01_v01", "length": 25, "label": 2}, {"file_name": "a12_s07_e04_v01", "length": 19, "label": 10}, {"file_name": "a08_s10_e04_v01", "length": 123, "label": 7}, {"file_name": "a02_s03_e02_v01", "length": 50, "label": 2}, {"file_name": "a09_s05_e06_v01", "length": 57, "label": 8}, {"file_name": "a05_s10_e01_v01", "length": 36, "label": 5}, {"file_name": "a09_s10_e01_v01", "length": 65, "label": 8}, {"file_name": "a08_s08_e04_v01", "length": 92, "label": 7}, {"file_name": "a06_s01_e02_v01", "length": 30, "label": 6}, {"file_name": "a01_s01_e01_v01", "length": 47, "label": 1}, {"file_name": "a06_s08_e04_v01", "length": 17, "label": 6}, {"file_name": "a09_s06_e03_v01", "length": 44, "label": 8}, {"file_name": "a06_s09_e01_v01", "length": 69, "label": 6}, {"file_name": "a08_s06_e01_v01", "length": 152, "label": 7}, {"file_name": "a02_s01_e04_v01", "length": 31, "label": 2}, {"file_name": "a11_s01_e00_v01", "length": 51, "label": 9}, {"file_name": "a05_s05_e02_v01", "length": 21, "label": 5}, {"file_name": "a03_s03_e00_v01", "length": 37, "label": 3}, {"file_name": "a01_s04_e04_v01", "length": 31, "label": 1}, {"file_name": "a06_s01_e04_v01", "length": 30, "label": 6}, {"file_name": "a09_s05_e05_v01", "length": 88, "label": 8}, {"file_name": "a01_s10_e01_v01", "length": 33, "label": 1}, {"file_name": "a03_s09_e00_v01", "length": 22, "label": 3}, {"file_name": "a08_s10_e00_v01", "length": 91, "label": 7}, {"file_name": "a05_s10_e02_v01", "length": 28, "label": 5}, {"file_name": "a03_s08_e05_v01", "length": 51, "label": 3}, {"file_name": "a04_s10_e01_v01", "length": 30, "label": 4}, {"file_name": "a05_s03_e04_v01", "length": 20, "label": 5}, {"file_name": "a05_s07_e02_v01", "length": 21, "label": 5}, {"file_name": "a12_s02_e04_v01", "length": 53, "label": 10}, {"file_name": "a06_s02_e03_v01", "length": 21, "label": 6}, {"file_name": "a09_s01_e03_v01", "length": 100, "label": 8}, {"file_name": "a08_s04_e00_v01", "length": 99, "label": 7}, {"file_name": "a02_s10_e01_v01", "length": 81, "label": 2}, {"file_name": "a11_s04_e01_v01", "length": 26, "label": 9}, {"file_name": "a03_s05_e01_v01", "length": 56, "label": 3}, {"file_name": "a06_s07_e04_v01", "length": 38, "label": 6}, {"file_name": "a09_s09_e03_v01", "length": 150, "label": 8}, {"file_name": "a02_s06_e02_v01", "length": 25, "label": 2}, {"file_name": "a05_s01_e04_v01", "length": 26, "label": 5}, {"file_name": "a11_s03_e04_v01", "length": 26, "label": 9}, {"file_name": "a04_s08_e02_v01", "length": 97, "label": 4}, {"file_name": "a04_s09_e04_v01", "length": 54, "label": 4}, {"file_name": "a08_s07_e00_v01", "length": 72, "label": 7}, {"file_name": "a04_s01_e05_v01", "length": 50, "label": 4}, {"file_name": "a12_s07_e01_v01", "length": 32, "label": 10}, {"file_name": "a02_s01_e03_v01", "length": 76, "label": 2}, {"file_name": "a11_s10_e05_v01", "length": 21, "label": 9}, {"file_name": "a09_s04_e00_v01", "length": 99, "label": 8}, {"file_name": "a09_s05_e01_v01", "length": 60, "label": 8}, {"file_name": "a09_s01_e04_v01", "length": 50, "label": 8}, {"file_name": "a12_s08_e00_v01", "length": 44, "label": 10}, {"file_name": "a04_s06_e03_v01", "length": 161, "label": 4}, {"file_name": "a05_s05_e00_v01", "length": 65, "label": 5}, {"file_name": "a11_s06_e01_v01", "length": 18, "label": 9}, {"file_name": "a01_s10_e02_v01", "length": 50, "label": 1}, {"file_name": "a04_s05_e01_v01", "length": 40, "label": 4}, {"file_name": "a02_s10_e04_v01", "length": 36, "label": 2}, {"file_name": "a02_s06_e05_v01", "length": 27, "label": 2}, {"file_name": "a11_s05_e00_v01", "length": 32, "label": 9}, {"file_name": "a04_s05_e06_v01", "length": 31, "label": 4}, {"file_name": "a04_s07_e01_v01", "length": 97, "label": 4}, {"file_name": "a03_s04_e01_v01", "length": 39, "label": 3}, {"file_name": "a03_s01_e02_v01", "length": 99, "label": 3}, {"file_name": "a06_s09_e02_v01", "length": 50, "label": 6}, {"file_name": "a03_s07_e00_v01", "length": 22, "label": 3}, {"file_name": "a08_s05_e05_v01", "length": 54, "label": 7}, {"file_name": "a06_s04_e02_v01", "length": 25, "label": 6}, {"file_name": "a12_s04_e01_v01", "length": 31, "label": 10}, {"file_name": "a09_s05_e00_v01", "length": 86, "label": 8}, {"file_name": "a04_s06_e02_v01", "length": 120, "label": 4}, {"file_name": "a04_s04_e04_v01", "length": 38, "label": 4}, {"file_name": "a09_s04_e02_v01", "length": 73, "label": 8}, {"file_name": "a02_s02_e01_v01", "length": 35, "label": 2}, {"file_name": "a06_s09_e00_v01", "length": 82, "label": 6}, {"file_name": "a05_s09_e00_v01", "length": 20, "label": 5}, {"file_name": "a05_s03_e01_v01", "length": 54, "label": 5}, {"file_name": "a02_s05_e04_v01", "length": 31, "label": 2}, {"file_name": "a01_s06_e01_v01", "length": 35, "label": 1}, {"file_name": "a01_s04_e05_v01", "length": 20, "label": 1}, {"file_name": "a12_s04_e02_v01", "length": 41, "label": 10}, {"file_name": "a03_s05_e02_v01", "length": 85, "label": 3}, {"file_name": "a03_s10_e04_v01", "length": 165, "label": 3}, {"file_name": "a01_s03_e02_v01", "length": 51, "label": 1}, {"file_name": "a05_s08_e05_v01", "length": 31, "label": 5}, {"file_name": "a01_s03_e00_v01", "length": 25, "label": 1}, {"file_name": "a08_s06_e03_v01", "length": 175, "label": 7}, {"file_name": "a04_s04_e07_v01", "length": 37, "label": 4}, {"file_name": "a05_s09_e02_v01", "length": 22, "label": 5}, {"file_name": "a01_s02_e01_v01", "length": 32, "label": 1}, {"file_name": "a01_s03_e01_v01", "length": 53, "label": 1}, {"file_name": "a04_s03_e01_v01", "length": 33, "label": 4}, {"file_name": "a06_s06_e00_v01", "length": 27, "label": 6}, {"file_name": "a12_s06_e02_v01", "length": 22, "label": 10}, {"file_name": "a04_s10_e04_v01", "length": 21, "label": 4}, {"file_name": "a12_s03_e01_v01", "length": 54, "label": 10}, {"file_name": "a08_s04_e02_v01", "length": 124, "label": 7}, {"file_name": "a06_s04_e04_v01", "length": 29, "label": 6}, {"file_name": "a12_s06_e03_v01", "length": 26, "label": 10}, {"file_name": "a08_s01_e04_v01", "length": 141, "label": 7}, {"file_name": "a04_s03_e00_v01", "length": 33, "label": 4}, {"file_name": "a12_s05_e02_v01", "length": 45, "label": 10}, {"file_name": "a08_s01_e00_v01", "length": 111, "label": 7}, {"file_name": "a01_s03_e03_v01", "length": 41, "label": 1}, {"file_name": "a01_s04_e02_v01", "length": 44, "label": 1}, {"file_name": "a06_s05_e00_v01", "length": 30, "label": 6}, {"file_name": "a01_s10_e04_v01", "length": 70, "label": 1}, {"file_name": "a08_s05_e00_v01", "length": 110, "label": 7}, {"file_name": "a09_s02_e00_v01", "length": 40, "label": 8}, {"file_name": "a12_s04_e05_v01", "length": 42, "label": 10}, {"file_name": "a06_s07_e02_v01", "length": 41, "label": 6}, {"file_name": "a08_s07_e02_v01", "length": 95, "label": 7}, {"file_name": "a11_s10_e01_v01", "length": 38, "label": 9}, {"file_name": "a02_s07_e00_v01", "length": 33, "label": 2}, {"file_name": "a06_s08_e01_v01", "length": 17, "label": 6}, {"file_name": "a01_s10_e03_v01", "length": 32, "label": 1}, {"file_name": "a11_s02_e04_v01", "length": 38, "label": 9}, {"file_name": "a12_s03_e03_v01", "length": 31, "label": 10}, {"file_name": "a05_s01_e01_v01", "length": 21, "label": 5}, {"file_name": "a05_s08_e02_v01", "length": 13, "label": 5}, {"file_name": "a09_s08_e01_v01", "length": 84, "label": 8}, {"file_name": "a01_s08_e04_v01", "length": 34, "label": 1}, {"file_name": "a09_s09_e00_v01", "length": 128, "label": 8}, {"file_name": "a03_s10_e03_v01", "length": 43, "label": 3}, {"file_name": "a09_s05_e03_v01", "length": 96, "label": 8}, {"file_name": "a09_s02_e04_v01", "length": 84, "label": 8}, {"file_name": "a08_s01_e01_v01", "length": 81, "label": 7}, {"file_name": "a09_s10_e00_v01", "length": 76, "label": 8}, {"file_name": "a04_s04_e10_v01", "length": 22, "label": 4}, {"file_name": "a05_s01_e00_v01", "length": 24, "label": 5}, {"file_name": "a06_s02_e01_v01", "length": 38, "label": 6}, {"file_name": "a08_s08_e03_v01", "length": 82, "label": 7}, {"file_name": "a04_s04_e03_v01", "length": 31, "label": 4}, {"file_name": "a12_s05_e04_v01", "length": 41, "label": 10}, {"file_name": "a05_s10_e05_v01", "length": 48, "label": 5}, {"file_name": "a02_s10_e02_v01", "length": 49, "label": 2}, {"file_name": "a06_s03_e03_v01", "length": 40, "label": 6}, {"file_name": "a05_s07_e04_v01", "length": 20, "label": 5}, {"file_name": "a02_s10_e00_v01", "length": 50, "label": 2}, {"file_name": "a08_s05_e03_v01", "length": 90, "label": 7}, {"file_name": "a12_s04_e00_v01", "length": 65, "label": 10}, {"file_name": "a03_s04_e02_v01", "length": 46, "label": 3}, {"file_name": "a06_s02_e02_v01", "length": 30, "label": 6}, {"file_name": "a03_s04_e03_v01", "length": 47, "label": 3}, {"file_name": "a11_s08_e03_v01", "length": 46, "label": 9}, {"file_name": "a09_s07_e03_v01", "length": 47, "label": 8}, {"file_name": "a05_s03_e03_v01", "length": 26, "label": 5}, {"file_name": "a09_s10_e03_v01", "length": 58, "label": 8}, {"file_name": "a01_s05_e03_v01", "length": 51, "label": 1}, {"file_name": "a11_s06_e02_v01", "length": 21, "label": 9}, {"file_name": "a05_s05_e01_v01", "length": 31, "label": 5}, {"file_name": "a01_s05_e01_v01", "length": 54, "label": 1}, {"file_name": "a04_s04_e02_v01", "length": 46, "label": 4}, {"file_name": "a11_s08_e02_v01", "length": 32, "label": 9}, {"file_name": "a11_s07_e03_v01", "length": 13, "label": 9}, {"file_name": "a06_s01_e01_v01", "length": 26, "label": 6}, {"file_name": "a06_s10_e05_v01", "length": 20, "label": 6}, {"file_name": "a12_s06_e00_v01", "length": 23, "label": 10}, {"file_name": "a12_s03_e02_v01", "length": 26, "label": 10}, {"file_name": "a08_s05_e02_v01", "length": 73, "label": 7}, {"file_name": "a03_s04_e00_v01", "length": 36, "label": 3}, {"file_name": "a11_s01_e03_v01", "length": 45, "label": 9}, {"file_name": "a03_s08_e01_v01", "length": 55, "label": 3}, {"file_name": "a11_s04_e00_v01", "length": 27, "label": 9}, {"file_name": "a04_s05_e00_v01", "length": 83, "label": 4}, {"file_name": "a12_s05_e01_v01", "length": 30, "label": 10}, {"file_name": "a02_s05_e02_v01", "length": 30, "label": 2}, {"file_name": "a06_s06_e01_v01", "length": 20, "label": 6}, {"file_name": "a03_s03_e02_v01", "length": 62, "label": 3}, {"file_name": "a11_s07_e02_v01", "length": 38, "label": 9}, {"file_name": "a11_s01_e02_v01", "length": 26, "label": 9}, {"file_name": "a05_s04_e02_v02", "length": 46, "label": 5}, {"file_name": "a12_s09_e04_v02", "length": 16, "label": 10}, {"file_name": "a03_s03_e04_v02", "length": 35, "label": 3}, {"file_name": "a08_s02_e01_v02", "length": 145, "label": 7}, {"file_name": "a03_s05_e03_v02", "length": 26, "label": 3}, {"file_name": "a06_s05_e01_v02", "length": 21, "label": 6}, {"file_name": "a12_s10_e01_v02", "length": 21, "label": 10}, {"file_name": "a01_s07_e03_v02", "length": 26, "label": 1}, {"file_name": "a03_s08_e02_v02", "length": 21, "label": 3}, {"file_name": "a11_s10_e03_v02", "length": 21, "label": 9}, {"file_name": "a04_s06_e05_v02", "length": 24, "label": 4}, {"file_name": "a11_s03_e00_v02", "length": 40, "label": 9}, {"file_name": "a03_s02_e00_v02", "length": 32, "label": 3}, {"file_name": "a11_s01_e04_v02", "length": 21, "label": 9}, {"file_name": "a04_s05_e04_v02", "length": 30, "label": 4}, {"file_name": "a09_s08_e04_v02", "length": 48, "label": 8}, {"file_name": "a09_s06_e01_v02", "length": 33, "label": 8}, {"file_name": "a09_s07_e01_v02", "length": 36, "label": 8}, {"file_name": "a02_s08_e01_v02", "length": 21, "label": 2}, {"file_name": "a01_s04_e01_v02", "length": 41, "label": 1}, {"file_name": "a02_s02_e02_v02", "length": 31, "label": 2}, {"file_name": "a02_s07_e05_v02", "length": 31, "label": 2}, {"file_name": "a06_s02_e00_v02", "length": 25, "label": 6}, {"file_name": "a03_s02_e02_v02", "length": 22, "label": 3}, {"file_name": "a11_s09_e04_v02", "length": 21, "label": 9}, {"file_name": "a09_s03_e04_v02", "length": 61, "label": 8}, {"file_name": "a04_s01_e02_v02", "length": 37, "label": 4}, {"file_name": "a12_s01_e01_v02", "length": 47, "label": 10}, {"file_name": "a02_s07_e03_v02", "length": 9, "label": 2}, {"file_name": "a05_s08_e04_v02", "length": 21, "label": 5}, {"file_name": "a02_s07_e02_v02", "length": 31, "label": 2}, {"file_name": "a04_s07_e02_v02", "length": 18, "label": 4}, {"file_name": "a01_s08_e03_v02", "length": 31, "label": 1}, {"file_name": "a08_s03_e01_v02", "length": 81, "label": 7}, {"file_name": "a04_s08_e03_v02", "length": 16, "label": 4}, {"file_name": "a03_s10_e00_v02", "length": 17, "label": 3}, {"file_name": "a04_s03_e03_v02", "length": 44, "label": 4}, {"file_name": "a11_s05_e02_v02", "length": 29, "label": 9}, {"file_name": "a06_s06_e02_v02", "length": 18, "label": 6}, {"file_name": "a09_s03_e00_v02", "length": 88, "label": 8}, {"file_name": "a09_s03_e03_v02", "length": 58, "label": 8}, {"file_name": "a04_s02_e02_v02", "length": 104, "label": 4}, {"file_name": "a08_s01_e02_v02", "length": 83, "label": 7}, {"file_name": "a04_s04_e00_v02", "length": 46, "label": 4}, {"file_name": "a03_s02_e03_v02", "length": 39, "label": 3}, {"file_name": "a05_s04_e00_v02", "length": 19, "label": 5}, {"file_name": "a05_s07_e03_v02", "length": 16, "label": 5}, {"file_name": "a06_s10_e00_v02", "length": 26, "label": 6}, {"file_name": "a11_s07_e00_v02", "length": 26, "label": 9}, {"file_name": "a03_s01_e01_v02", "length": 24, "label": 3}, {"file_name": "a04_s06_e01_v02", "length": 16, "label": 4}, {"file_name": "a08_s02_e04_v02", "length": 102, "label": 7}, {"file_name": "a09_s08_e03_v02", "length": 41, "label": 8}, {"file_name": "a05_s07_e00_v02", "length": 16, "label": 5}, {"file_name": "a05_s02_e02_v02", "length": 27, "label": 5}, {"file_name": "a04_s06_e04_v02", "length": 21, "label": 4}, {"file_name": "a05_s09_e03_v02", "length": 21, "label": 5}, {"file_name": "a03_s06_e02_v02", "length": 15, "label": 3}, {"file_name": "a01_s01_e00_v02", "length": 30, "label": 1}, {"file_name": "a06_s06_e03_v02", "length": 13, "label": 6}, {"file_name": "a06_s10_e02_v02", "length": 21, "label": 6}, {"file_name": "a02_s07_e04_v02", "length": 36, "label": 2}, {"file_name": "a09_s06_e00_v02", "length": 68, "label": 8}, {"file_name": "a04_s07_e04_v02", "length": 21, "label": 4}, {"file_name": "a05_s02_e01_v02", "length": 36, "label": 5}, {"file_name": "a01_s06_e04_v02", "length": 17, "label": 1}, {"file_name": "a04_s08_e01_v02", "length": 21, "label": 4}, {"file_name": "a01_s09_e00_v02", "length": 31, "label": 1}, {"file_name": "a08_s03_e03_v02", "length": 71, "label": 7}, {"file_name": "a12_s03_e00_v02", "length": 41, "label": 10}, {"file_name": "a11_s02_e03_v02", "length": 26, "label": 9}, {"file_name": "a12_s07_e02_v02", "length": 11, "label": 10}, {"file_name": "a11_s05_e01_v02", "length": 35, "label": 9}, {"file_name": "a05_s06_e01_v02", "length": 14, "label": 5}, {"file_name": "a06_s02_e04_v02", "length": 14, "label": 6}, {"file_name": "a06_s04_e00_v02", "length": 18, "label": 6}, {"file_name": "a05_s09_e01_v02", "length": 31, "label": 5}, {"file_name": "a11_s05_e03_v02", "length": 34, "label": 9}, {"file_name": "a03_s01_e00_v02", "length": 33, "label": 3}, {"file_name": "a11_s02_e01_v02", "length": 32, "label": 9}, {"file_name": "a04_s02_e00_v02", "length": 57, "label": 4}, {"file_name": "a11_s01_e01_v02", "length": 26, "label": 9}, {"file_name": "a02_s06_e03_v02", "length": 21, "label": 2}, {"file_name": "a12_s10_e03_v02", "length": 21, "label": 10}, {"file_name": "a01_s05_e02_v02", "length": 19, "label": 1}, {"file_name": "a01_s06_e00_v02", "length": 21, "label": 1}, {"file_name": "a05_s07_e01_v02", "length": 21, "label": 5}, {"file_name": "a01_s09_e01_v02", "length": 26, "label": 1}, {"file_name": "a02_s06_e00_v02", "length": 18, "label": 2}, {"file_name": "a11_s09_e00_v02", "length": 11, "label": 9}, {"file_name": "a03_s03_e01_v02", "length": 47, "label": 3}, {"file_name": "a03_s08_e00_v02", "length": 22, "label": 3}, {"file_name": "a06_s04_e01_v02", "length": 21, "label": 6}, {"file_name": "a02_s05_e01_v02", "length": 34, "label": 2}, {"file_name": "a03_s04_e04_v02", "length": 29, "label": 3}, {"file_name": "a01_s09_e02_v02", "length": 22, "label": 1}, {"file_name": "a08_s03_e04_v02", "length": 59, "label": 7}, {"file_name": "a01_s10_e00_v02", "length": 28, "label": 1}, {"file_name": "a01_s02_e02_v02", "length": 23, "label": 1}, {"file_name": "a09_s03_e01_v02", "length": 42, "label": 8}, {"file_name": "a05_s06_e00_v02", "length": 23, "label": 5}, {"file_name": "a05_s01_e02_v02", "length": 31, "label": 5}, {"file_name": "a02_s02_e04_v02", "length": 28, "label": 2}, {"file_name": "a06_s07_e03_v02", "length": 21, "label": 6}, {"file_name": "a04_s02_e04_v02", "length": 23, "label": 4}, {"file_name": "a04_s05_e02_v02", "length": 29, "label": 4}, {"file_name": "a02_s07_e01_v02", "length": 31, "label": 2}, {"file_name": "a04_s02_e06_v02", "length": 28, "label": 4}, {"file_name": "a03_s07_e03_v02", "length": 11, "label": 3}, {"file_name": "a12_s08_e01_v02", "length": 14, "label": 10}, {"file_name": "a05_s01_e03_v02", "length": 31, "label": 5}, {"file_name": "a02_s09_e02_v02", "length": 43, "label": 2}, {"file_name": "a05_s08_e03_v02", "length": 26, "label": 5}, {"file_name": "a04_s06_e00_v02", "length": 18, "label": 4}, {"file_name": "a09_s01_e02_v02", "length": 67, "label": 8}, {"file_name": "a12_s09_e00_v02", "length": 21, "label": 10}, {"file_name": "a04_s09_e02_v02", "length": 16, "label": 4}, {"file_name": "a03_s03_e03_v02", "length": 43, "label": 3}, {"file_name": "a08_s07_e03_v02", "length": 54, "label": 7}, {"file_name": "a08_s09_e02_v02", "length": 76, "label": 7}, {"file_name": "a08_s09_e00_v02", "length": 71, "label": 7}, {"file_name": "a06_s06_e04_v02", "length": 16, "label": 6}, {"file_name": "a01_s07_e04_v02", "length": 21, "label": 1}, {"file_name": "a08_s05_e04_v02", "length": 45, "label": 7}, {"file_name": "a05_s04_e01_v02", "length": 26, "label": 5}, {"file_name": "a04_s07_e00_v02", "length": 23, "label": 4}, {"file_name": "a05_s08_e01_v02", "length": 21, "label": 5}, {"file_name": "a11_s06_e03_v02", "length": 17, "label": 9}, {"file_name": "a01_s04_e03_v02", "length": 34, "label": 1}, {"file_name": "a11_s06_e04_v02", "length": 8, "label": 9}, {"file_name": "a12_s07_e03_v02", "length": 16, "label": 10}, {"file_name": "a01_s02_e04_v02", "length": 21, "label": 1}, {"file_name": "a04_s04_e05_v02", "length": 132, "label": 4}, {"file_name": "a03_s01_e03_v02", "length": 36, "label": 3}, {"file_name": "a12_s02_e02_v02", "length": 38, "label": 10}, {"file_name": "a03_s06_e01_v02", "length": 17, "label": 3}, {"file_name": "a05_s02_e03_v02", "length": 28, "label": 5}, {"file_name": "a03_s02_e04_v02", "length": 23, "label": 3}, {"file_name": "a08_s02_e03_v02", "length": 113, "label": 7}, {"file_name": "a08_s03_e02_v02", "length": 67, "label": 7}, {"file_name": "a09_s01_e01_v02", "length": 55, "label": 8}, {"file_name": "a02_s01_e01_v02", "length": 30, "label": 2}, {"file_name": "a08_s06_e00_v02", "length": 86, "label": 7}, {"file_name": "a12_s08_e02_v02", "length": 16, "label": 10}, {"file_name": "a02_s08_e00_v02", "length": 26, "label": 2}, {"file_name": "a01_s08_e02_v02", "length": 33, "label": 1}, {"file_name": "a09_s04_e01_v02", "length": 74, "label": 8}, {"file_name": "a04_s01_e04_v02", "length": 26, "label": 4}, {"file_name": "a04_s05_e03_v02", "length": 31, "label": 4}, {"file_name": "a08_s10_e03_v02", "length": 61, "label": 7}, {"file_name": "a02_s05_e00_v02", "length": 28, "label": 2}, {"file_name": "a06_s04_e03_v02", "length": 24, "label": 6}, {"file_name": "a06_s09_e03_v02", "length": 21, "label": 6}, {"file_name": "a05_s03_e02_v02", "length": 21, "label": 5}, {"file_name": "a06_s03_e04_v02", "length": 12, "label": 6}, {"file_name": "a06_s01_e03_v02", "length": 16, "label": 6}, {"file_name": "a11_s03_e01_v02", "length": 23, "label": 9}, {"file_name": "a09_s02_e01_v02", "length": 33, "label": 8}, {"file_name": "a02_s02_e00_v02", "length": 42, "label": 2}, {"file_name": "a01_s01_e03_v02", "length": 39, "label": 1}, {"file_name": "a08_s06_e02_v02", "length": 83, "label": 7}, {"file_name": "a12_s01_e03_v02", "length": 41, "label": 10}, {"file_name": "a06_s05_e04_v02", "length": 16, "label": 6}, {"file_name": "a01_s04_e06_v02", "length": 24, "label": 1}, {"file_name": "a09_s09_e01_v02", "length": 41, "label": 8}, {"file_name": "a04_s10_e03_v02", "length": 16, "label": 4}, {"file_name": "a06_s09_e04_v02", "length": 16, "label": 6}, {"file_name": "a02_s04_e01_v02", "length": 31, "label": 2}, {"file_name": "a12_s10_e04_v02", "length": 14, "label": 10}, {"file_name": "a04_s03_e05_v02", "length": 42, "label": 4}, {"file_name": "a06_s03_e01_v02", "length": 25, "label": 6}, {"file_name": "a02_s03_e04_v02", "length": 62, "label": 2}, {"file_name": "a11_s09_e02_v02", "length": 25, "label": 9}, {"file_name": "a08_s08_e02_v02", "length": 53, "label": 7}, {"file_name": "a03_s02_e01_v02", "length": 36, "label": 3}, {"file_name": "a12_s02_e00_v02", "length": 50, "label": 10}, {"file_name": "a12_s08_e03_v02", "length": 13, "label": 10}, {"file_name": "a02_s09_e03_v02", "length": 31, "label": 2}, {"file_name": "a09_s02_e02_v02", "length": 46, "label": 8}, {"file_name": "a05_s09_e04_v02", "length": 21, "label": 5}, {"file_name": "a01_s04_e00_v02", "length": 26, "label": 1}, {"file_name": "a08_s04_e03_v02", "length": 121, "label": 7}, {"file_name": "a08_s05_e01_v02", "length": 59, "label": 7}, {"file_name": "a12_s09_e03_v02", "length": 16, "label": 10}, {"file_name": "a02_s04_e03_v02", "length": 31, "label": 2}, {"file_name": "a04_s03_e04_v02", "length": 49, "label": 4}, {"file_name": "a12_s06_e01_v02", "length": 16, "label": 10}, {"file_name": "a11_s04_e03_v02", "length": 32, "label": 9}, {"file_name": "a05_s03_e00_v02", "length": 22, "label": 5}, {"file_name": "a12_s07_e00_v02", "length": 18, "label": 10}, {"file_name": "a06_s03_e02_v02", "length": 16, "label": 6}, {"file_name": "a03_s03_e05_v02", "length": 33, "label": 3}, {"file_name": "a11_s08_e01_v02", "length": 22, "label": 9}, {"file_name": "a05_s05_e04_v02", "length": 17, "label": 5}, {"file_name": "a06_s10_e01_v02", "length": 17, "label": 6}, {"file_name": "a04_s03_e02_v02", "length": 108, "label": 4}, {"file_name": "a02_s03_e03_v02", "length": 56, "label": 2}, {"file_name": "a09_s10_e04_v02", "length": 36, "label": 8}, {"file_name": "a04_s08_e04_v02", "length": 36, "label": 4}, {"file_name": "a11_s08_e00_v02", "length": 35, "label": 9}, {"file_name": "a02_s01_e00_v02", "length": 39, "label": 2}, {"file_name": "a04_s02_e03_v02", "length": 45, "label": 4}, {"file_name": "a04_s02_e01_v02", "length": 113, "label": 4}, {"file_name": "a06_s08_e00_v02", "length": 19, "label": 6}, {"file_name": "a08_s08_e01_v02", "length": 49, "label": 7}, {"file_name": "a02_s03_e01_v02", "length": 45, "label": 2}, {"file_name": "a11_s02_e02_v02", "length": 33, "label": 9}, {"file_name": "a09_s07_e02_v02", "length": 29, "label": 8}, {"file_name": "a02_s05_e03_v02", "length": 21, "label": 2}, {"file_name": "a01_s07_e02_v02", "length": 23, "label": 1}, {"file_name": "a06_s05_e03_v02", "length": 15, "label": 6}, {"file_name": "a12_s05_e03_v02", "length": 33, "label": 10}, {"file_name": "a03_s05_e00_v02", "length": 20, "label": 3}, {"file_name": "a09_s03_e02_v02", "length": 58, "label": 8}, {"file_name": "a09_s04_e04_v02", "length": 138, "label": 8}, {"file_name": "a11_s10_e00_v02", "length": 21, "label": 9}, {"file_name": "a04_s04_e01_v02", "length": 35, "label": 4}, {"file_name": "a02_s08_e02_v02", "length": 21, "label": 2}, {"file_name": "a01_s05_e00_v02", "length": 27, "label": 1}, {"file_name": "a04_s01_e07_v02", "length": 34, "label": 4}, {"file_name": "a11_s06_e00_v02", "length": 27, "label": 9}, {"file_name": "a05_s02_e00_v02", "length": 36, "label": 5}, {"file_name": "a02_s02_e03_v02", "length": 29, "label": 2}, {"file_name": "a09_s05_e02_v02", "length": 51, "label": 8}, {"file_name": "a05_s06_e02_v02", "length": 16, "label": 5}, {"file_name": "a08_s01_e03_v02", "length": 80, "label": 7}, {"file_name": "a08_s09_e01_v02", "length": 62, "label": 7}, {"file_name": "a02_s08_e04_v02", "length": 36, "label": 2}, {"file_name": "a06_s05_e02_v02", "length": 21, "label": 6}, {"file_name": "a01_s02_e03_v02", "length": 24, "label": 1}, {"file_name": "a03_s09_e02_v02", "length": 26, "label": 3}, {"file_name": "a04_s08_e00_v02", "length": 31, "label": 4}, {"file_name": "a12_s03_e04_v02", "length": 46, "label": 10}, {"file_name": "a08_s04_e01_v02", "length": 126, "label": 7}, {"file_name": "a12_s04_e03_v02", "length": 35, "label": 10}, {"file_name": "a04_s09_e03_v02", "length": 26, "label": 4}, {"file_name": "a12_s05_e00_v02", "length": 31, "label": 10}, {"file_name": "a11_s05_e04_v02", "length": 25, "label": 9}, {"file_name": "a05_s06_e03_v02", "length": 30, "label": 5}, {"file_name": "a09_s06_e02_v02", "length": 39, "label": 8}, {"file_name": "a12_s02_e03_v02", "length": 27, "label": 10}, {"file_name": "a11_s03_e03_v02", "length": 21, "label": 9}, {"file_name": "a11_s07_e04_v02", "length": 17, "label": 9}, {"file_name": "a04_s01_e00_v02", "length": 43, "label": 4}, {"file_name": "a03_s08_e03_v02", "length": 14, "label": 3}, {"file_name": "a04_s10_e00_v02", "length": 21, "label": 4}, {"file_name": "a08_s03_e00_v02", "length": 116, "label": 7}, {"file_name": "a02_s08_e03_v02", "length": 21, "label": 2}, {"file_name": "a01_s09_e03_v02", "length": 24, "label": 1}, {"file_name": "a01_s01_e04_v02", "length": 29, "label": 1}, {"file_name": "a01_s07_e00_v02", "length": 21, "label": 1}, {"file_name": "a02_s03_e00_v02", "length": 46, "label": 2}, {"file_name": "a01_s02_e00_v02", "length": 23, "label": 1}, {"file_name": "a03_s09_e04_v02", "length": 21, "label": 3}, {"file_name": "a01_s06_e02_v02", "length": 21, "label": 1}, {"file_name": "a03_s07_e02_v02", "length": 17, "label": 3}, {"file_name": "a03_s05_e04_v02", "length": 39, "label": 3}, {"file_name": "a08_s07_e01_v02", "length": 104, "label": 7}, {"file_name": "a04_s07_e03_v02", "length": 21, "label": 4}, {"file_name": "a08_s04_e04_v02", "length": 124, "label": 7}, {"file_name": "a08_s08_e00_v02", "length": 58, "label": 7}, {"file_name": "a02_s09_e00_v02", "length": 37, "label": 2}, {"file_name": "a06_s03_e00_v02", "length": 24, "label": 6}, {"file_name": "a09_s09_e04_v02", "length": 36, "label": 8}, {"file_name": "a05_s04_e04_v02", "length": 21, "label": 5}, {"file_name": "a09_s04_e03_v02", "length": 61, "label": 8}, {"file_name": "a01_s09_e04_v02", "length": 28, "label": 1}, {"file_name": "a05_s10_e00_v02", "length": 26, "label": 5}, {"file_name": "a09_s08_e02_v02", "length": 36, "label": 8}, {"file_name": "a11_s07_e01_v02", "length": 15, "label": 9}, {"file_name": "a06_s01_e00_v02", "length": 21, "label": 6}, {"file_name": "a12_s08_e04_v02", "length": 14, "label": 10}, {"file_name": "a08_s09_e04_v02", "length": 56, "label": 7}, {"file_name": "a12_s10_e02_v02", "length": 16, "label": 10}, {"file_name": "a04_s01_e01_v02", "length": 83, "label": 4}, {"file_name": "a01_s08_e01_v02", "length": 26, "label": 1}, {"file_name": "a09_s07_e00_v02", "length": 31, "label": 8}, {"file_name": "a04_s09_e00_v02", "length": 26, "label": 4}, {"file_name": "a08_s02_e02_v02", "length": 134, "label": 7}, {"file_name": "a09_s09_e02_v02", "length": 57, "label": 8}, {"file_name": "a09_s02_e03_v02", "length": 46, "label": 8}, {"file_name": "a11_s09_e01_v02", "length": 14, "label": 9}, {"file_name": "a03_s10_e01_v02", "length": 11, "label": 3}, {"file_name": "a11_s03_e02_v02", "length": 36, "label": 9}, {"file_name": "a11_s08_e04_v02", "length": 16, "label": 9}, {"file_name": "a06_s08_e02_v02", "length": 16, "label": 6}, {"file_name": "a12_s01_e00_v02", "length": 21, "label": 10}, {"file_name": "a02_s06_e04_v02", "length": 21, "label": 2}, {"file_name": "a06_s07_e01_v02", "length": 21, "label": 6}, {"file_name": "a05_s10_e03_v02", "length": 21, "label": 5}, {"file_name": "a09_s05_e04_v02", "length": 66, "label": 8}, {"file_name": "a03_s06_e00_v02", "length": 23, "label": 3}, {"file_name": "a12_s02_e01_v02", "length": 40, "label": 10}, {"file_name": "a08_s10_e02_v02", "length": 56, "label": 7}, {"file_name": "a08_s02_e00_v02", "length": 111, "label": 7}, {"file_name": "a06_s10_e03_v02", "length": 21, "label": 6}, {"file_name": "a11_s04_e02_v02", "length": 33, "label": 9}, {"file_name": "a08_s09_e03_v02", "length": 66, "label": 7}, {"file_name": "a12_s06_e04_v02", "length": 11, "label": 10}, {"file_name": "a01_s07_e01_v02", "length": 27, "label": 1}, {"file_name": "a05_s02_e04_v02", "length": 22, "label": 5}, {"file_name": "a09_s08_e00_v02", "length": 41, "label": 8}, {"file_name": "a02_s04_e04_v02", "length": 33, "label": 2}, {"file_name": "a06_s07_e00_v02", "length": 15, "label": 6}, {"file_name": "a04_s09_e01_v02", "length": 21, "label": 4}, {"file_name": "a09_s01_e00_v02", "length": 42, "label": 8}, {"file_name": "a08_s10_e01_v02", "length": 91, "label": 7}, {"file_name": "a11_s10_e02_v02", "length": 56, "label": 9}, {"file_name": "a09_s10_e02_v02", "length": 41, "label": 8}, {"file_name": "a03_s07_e04_v02", "length": 11, "label": 3}, {"file_name": "a05_s08_e00_v02", "length": 26, "label": 5}, {"file_name": "a05_s05_e03_v02", "length": 25, "label": 5}, {"file_name": "a11_s09_e03_v02", "length": 11, "label": 9}, {"file_name": "a12_s04_e04_v02", "length": 36, "label": 10}, {"file_name": "a04_s01_e03_v02", "length": 30, "label": 4}, {"file_name": "a04_s10_e02_v02", "length": 21, "label": 4}, {"file_name": "a06_s10_e04_v02", "length": 21, "label": 6}, {"file_name": "a01_s08_e00_v02", "length": 21, "label": 1}, {"file_name": "a03_s10_e02_v02", "length": 28, "label": 3}, {"file_name": "a03_s07_e01_v02", "length": 11, "label": 3}, {"file_name": "a05_s04_e03_v02", "length": 22, "label": 5}, {"file_name": "a01_s01_e02_v02", "length": 31, "label": 1}, {"file_name": "a05_s10_e04_v02", "length": 21, "label": 5}, {"file_name": "a06_s08_e03_v02", "length": 21, "label": 6}, {"file_name": "a02_s04_e02_v02", "length": 33, "label": 2}, {"file_name": "a04_s01_e09_v02", "length": 33, "label": 4}, {"file_name": "a12_s01_e04_v02", "length": 37, "label": 10}, {"file_name": "a02_s01_e02_v02", "length": 28, "label": 2}, {"file_name": "a12_s10_e00_v02", "length": 21, "label": 10}, {"file_name": "a11_s02_e00_v02", "length": 40, "label": 9}, {"file_name": "a02_s09_e01_v02", "length": 40, "label": 2}, {"file_name": "a02_s04_e00_v02", "length": 46, "label": 2}, {"file_name": "a12_s01_e02_v02", "length": 27, "label": 10}, {"file_name": "a04_s02_e05_v02", "length": 61, "label": 4}, {"file_name": "a03_s01_e04_v02", "length": 36, "label": 3}, {"file_name": "a01_s03_e04_v02", "length": 46, "label": 1}, {"file_name": "a02_s06_e01_v02", "length": 16, "label": 2}, {"file_name": "a12_s07_e04_v02", "length": 11, "label": 10}, {"file_name": "a12_s03_e05_v02", "length": 33, "label": 10}, {"file_name": "a08_s10_e04_v02", "length": 66, "label": 7}, {"file_name": "a02_s03_e02_v02", "length": 58, "label": 2}, {"file_name": "a05_s06_e04_v02", "length": 21, "label": 5}, {"file_name": "a05_s10_e01_v02", "length": 21, "label": 5}, {"file_name": "a09_s10_e01_v02", "length": 49, "label": 8}, {"file_name": "a08_s08_e04_v02", "length": 61, "label": 7}, {"file_name": "a06_s01_e02_v02", "length": 11, "label": 6}, {"file_name": "a01_s01_e01_v02", "length": 28, "label": 1}, {"file_name": "a06_s08_e04_v02", "length": 21, "label": 6}, {"file_name": "a09_s06_e03_v02", "length": 47, "label": 8}, {"file_name": "a06_s09_e01_v02", "length": 16, "label": 6}, {"file_name": "a08_s06_e01_v02", "length": 116, "label": 7}, {"file_name": "a02_s01_e04_v02", "length": 38, "label": 2}, {"file_name": "a11_s01_e00_v02", "length": 31, "label": 9}, {"file_name": "a05_s05_e02_v02", "length": 17, "label": 5}, {"file_name": "a03_s03_e00_v02", "length": 41, "label": 3}, {"file_name": "a01_s04_e04_v02", "length": 34, "label": 1}, {"file_name": "a06_s01_e04_v02", "length": 21, "label": 6}, {"file_name": "a09_s05_e05_v02", "length": 48, "label": 8}, {"file_name": "a01_s10_e01_v02", "length": 21, "label": 1}, {"file_name": "a03_s09_e00_v02", "length": 26, "label": 3}, {"file_name": "a08_s10_e00_v02", "length": 67, "label": 7}, {"file_name": "a05_s10_e02_v02", "length": 21, "label": 5}, {"file_name": "a04_s10_e01_v02", "length": 23, "label": 4}, {"file_name": "a05_s03_e04_v02", "length": 26, "label": 5}, {"file_name": "a05_s07_e02_v02", "length": 36, "label": 5}, {"file_name": "a12_s02_e04_v02", "length": 37, "label": 10}, {"file_name": "a04_s02_e07_v02", "length": 47, "label": 4}, {"file_name": "a06_s02_e03_v02", "length": 13, "label": 6}, {"file_name": "a09_s01_e03_v02", "length": 56, "label": 8}, {"file_name": "a08_s04_e00_v02", "length": 86, "label": 7}, {"file_name": "a02_s10_e01_v02", "length": 32, "label": 2}, {"file_name": "a11_s04_e01_v02", "length": 15, "label": 9}, {"file_name": "a03_s05_e01_v02", "length": 39, "label": 3}, {"file_name": "a06_s07_e04_v02", "length": 19, "label": 6}, {"file_name": "a09_s09_e03_v02", "length": 51, "label": 8}, {"file_name": "a02_s06_e02_v02", "length": 21, "label": 2}, {"file_name": "a05_s01_e04_v02", "length": 21, "label": 5}, {"file_name": "a11_s03_e04_v02", "length": 12, "label": 9}, {"file_name": "a04_s08_e02_v02", "length": 21, "label": 4}, {"file_name": "a04_s09_e04_v02", "length": 36, "label": 4}, {"file_name": "a08_s07_e00_v02", "length": 53, "label": 7}, {"file_name": "a04_s01_e05_v02", "length": 37, "label": 4}, {"file_name": "a12_s07_e01_v02", "length": 14, "label": 10}, {"file_name": "a02_s01_e03_v02", "length": 40, "label": 2}, {"file_name": "a09_s04_e00_v02", "length": 84, "label": 8}, {"file_name": "a09_s05_e01_v02", "length": 65, "label": 8}, {"file_name": "a09_s01_e04_v02", "length": 65, "label": 8}, {"file_name": "a12_s08_e00_v02", "length": 13, "label": 10}, {"file_name": "a04_s06_e03_v02", "length": 12, "label": 4}, {"file_name": "a05_s05_e00_v02", "length": 41, "label": 5}, {"file_name": "a11_s06_e01_v02", "length": 17, "label": 9}, {"file_name": "a01_s10_e02_v02", "length": 26, "label": 1}, {"file_name": "a04_s05_e01_v02", "length": 26, "label": 4}, {"file_name": "a08_s05_e06_v02", "length": 24, "label": 7}, {"file_name": "a02_s10_e04_v02", "length": 29, "label": 2}, {"file_name": "a11_s05_e00_v02", "length": 27, "label": 9}, {"file_name": "a04_s07_e01_v02", "length": 21, "label": 4}, {"file_name": "a03_s04_e01_v02", "length": 39, "label": 3}, {"file_name": "a03_s01_e02_v02", "length": 31, "label": 3}, {"file_name": "a06_s09_e02_v02", "length": 16, "label": 6}, {"file_name": "a03_s07_e00_v02", "length": 21, "label": 3}, {"file_name": "a11_s05_e05_v02", "length": 29, "label": 9}, {"file_name": "a08_s05_e05_v02", "length": 44, "label": 7}, {"file_name": "a06_s04_e02_v02", "length": 41, "label": 6}, {"file_name": "a12_s04_e01_v02", "length": 36, "label": 10}, {"file_name": "a09_s05_e00_v02", "length": 70, "label": 8}, {"file_name": "a04_s06_e02_v02", "length": 16, "label": 4}, {"file_name": "a04_s04_e04_v02", "length": 53, "label": 4}, {"file_name": "a09_s04_e02_v02", "length": 61, "label": 8}, {"file_name": "a02_s02_e01_v02", "length": 26, "label": 2}, {"file_name": "a06_s09_e00_v02", "length": 16, "label": 6}, {"file_name": "a05_s09_e00_v02", "length": 21, "label": 5}, {"file_name": "a05_s03_e01_v02", "length": 28, "label": 5}, {"file_name": "a02_s05_e04_v02", "length": 29, "label": 2}, {"file_name": "a01_s06_e01_v02", "length": 24, "label": 1}, {"file_name": "a01_s04_e05_v02", "length": 29, "label": 1}, {"file_name": "a12_s04_e02_v02", "length": 23, "label": 10}, {"file_name": "a03_s05_e02_v02", "length": 36, "label": 3}, {"file_name": "a01_s03_e02_v02", "length": 61, "label": 1}, {"file_name": "a05_s04_e05_v02", "length": 21, "label": 5}, {"file_name": "a01_s03_e00_v02", "length": 26, "label": 1}, {"file_name": "a08_s06_e03_v02", "length": 103, "label": 7}, {"file_name": "a05_s09_e02_v02", "length": 21, "label": 5}, {"file_name": "a01_s02_e01_v02", "length": 21, "label": 1}, {"file_name": "a01_s03_e01_v02", "length": 42, "label": 1}, {"file_name": "a04_s03_e01_v02", "length": 29, "label": 4}, {"file_name": "a06_s06_e00_v02", "length": 16, "label": 6}, {"file_name": "a12_s06_e02_v02", "length": 26, "label": 10}, {"file_name": "a12_s03_e01_v02", "length": 44, "label": 10}, {"file_name": "a08_s04_e02_v02", "length": 116, "label": 7}, {"file_name": "a06_s04_e04_v02", "length": 20, "label": 6}, {"file_name": "a12_s06_e03_v02", "length": 14, "label": 10}, {"file_name": "a08_s01_e04_v02", "length": 81, "label": 7}, {"file_name": "a04_s03_e00_v02", "length": 28, "label": 4}, {"file_name": "a12_s05_e02_v02", "length": 28, "label": 10}, {"file_name": "a08_s01_e00_v02", "length": 146, "label": 7}, {"file_name": "a01_s03_e03_v02", "length": 53, "label": 1}, {"file_name": "a04_s01_e08_v02", "length": 83, "label": 4}, {"file_name": "a01_s04_e02_v02", "length": 26, "label": 1}, {"file_name": "a06_s05_e00_v02", "length": 30, "label": 6}, {"file_name": "a01_s10_e04_v02", "length": 21, "label": 1}, {"file_name": "a08_s05_e00_v02", "length": 61, "label": 7}, {"file_name": "a09_s02_e00_v02", "length": 32, "label": 8}, {"file_name": "a12_s04_e05_v02", "length": 29, "label": 10}, {"file_name": "a06_s07_e02_v02", "length": 21, "label": 6}, {"file_name": "a08_s07_e02_v02", "length": 40, "label": 7}, {"file_name": "a11_s10_e01_v02", "length": 31, "label": 9}, {"file_name": "a02_s07_e00_v02", "length": 31, "label": 2}, {"file_name": "a06_s08_e01_v02", "length": 16, "label": 6}, {"file_name": "a01_s10_e03_v02", "length": 25, "label": 1}, {"file_name": "a11_s02_e04_v02", "length": 35, "label": 9}, {"file_name": "a02_s09_e04_v02", "length": 1, "label": 2}, {"file_name": "a12_s03_e03_v02", "length": 39, "label": 10}, {"file_name": "a05_s01_e01_v02", "length": 24, "label": 5}, {"file_name": "a05_s08_e02_v02", "length": 16, "label": 5}, {"file_name": "a12_s09_e02_v02", "length": 21, "label": 10}, {"file_name": "a09_s08_e01_v02", "length": 40, "label": 8}, {"file_name": "a01_s08_e04_v02", "length": 21, "label": 1}, {"file_name": "a09_s09_e00_v02", "length": 51, "label": 8}, {"file_name": "a03_s10_e03_v02", "length": 13, "label": 3}, {"file_name": "a09_s05_e03_v02", "length": 46, "label": 8}, {"file_name": "a09_s02_e04_v02", "length": 49, "label": 8}, {"file_name": "a08_s01_e01_v02", "length": 91, "label": 7}, {"file_name": "a09_s10_e00_v02", "length": 41, "label": 8}, {"file_name": "a12_s09_e01_v02", "length": 16, "label": 10}, {"file_name": "a05_s01_e00_v02", "length": 26, "label": 5}, {"file_name": "a06_s02_e01_v02", "length": 13, "label": 6}, {"file_name": "a08_s08_e03_v02", "length": 56, "label": 7}, {"file_name": "a04_s04_e03_v02", "length": 61, "label": 4}, {"file_name": "a12_s05_e04_v02", "length": 36, "label": 10}, {"file_name": "a02_s10_e02_v02", "length": 31, "label": 2}, {"file_name": "a06_s03_e03_v02", "length": 16, "label": 6}, {"file_name": "a05_s07_e04_v02", "length": 21, "label": 5}, {"file_name": "a02_s10_e00_v02", "length": 38, "label": 2}, {"file_name": "a08_s05_e03_v02", "length": 46, "label": 7}, {"file_name": "a12_s04_e00_v02", "length": 46, "label": 10}, {"file_name": "a03_s04_e02_v02", "length": 27, "label": 3}, {"file_name": "a06_s02_e02_v02", "length": 11, "label": 6}, {"file_name": "a03_s04_e03_v02", "length": 31, "label": 3}, {"file_name": "a11_s08_e03_v02", "length": 21, "label": 9}, {"file_name": "a09_s07_e03_v02", "length": 35, "label": 8}, {"file_name": "a05_s03_e03_v02", "length": 26, "label": 5}, {"file_name": "a09_s10_e03_v02", "length": 31, "label": 8}, {"file_name": "a11_s06_e02_v02", "length": 16, "label": 9}, {"file_name": "a05_s05_e01_v02", "length": 23, "label": 5}, {"file_name": "a01_s05_e01_v02", "length": 35, "label": 1}, {"file_name": "a04_s04_e02_v02", "length": 34, "label": 4}, {"file_name": "a11_s08_e02_v02", "length": 17, "label": 9}, {"file_name": "a11_s07_e03_v02", "length": 21, "label": 9}, {"file_name": "a04_s01_e06_v02", "length": 31, "label": 4}, {"file_name": "a06_s01_e01_v02", "length": 21, "label": 6}, {"file_name": "a12_s03_e02_v02", "length": 39, "label": 10}, {"file_name": "a08_s05_e02_v02", "length": 51, "label": 7}, {"file_name": "a03_s04_e00_v02", "length": 26, "label": 3}, {"file_name": "a11_s01_e03_v02", "length": 31, "label": 9}, {"file_name": "a03_s08_e01_v02", "length": 21, "label": 3}, {"file_name": "a11_s04_e00_v02", "length": 32, "label": 9}, {"file_name": "a04_s05_e00_v02", "length": 36, "label": 4}, {"file_name": "a12_s05_e01_v02", "length": 31, "label": 10}, {"file_name": "a02_s05_e02_v02", "length": 26, "label": 2}, {"file_name": "a06_s06_e01_v02", "length": 16, "label": 6}, {"file_name": "a03_s03_e02_v02", "length": 32, "label": 3}, {"file_name": "a11_s07_e02_v02", "length": 21, "label": 9}, {"file_name": "a11_s01_e02_v02", "length": 21, "label": 9}]
+
+
+        self.labels_0based = []
+        for item in self.data_dict_raw: # 修改：应该遍历 self.data_dict_raw
+            label_one_based = item.get('label')
+            if isinstance(label_one_based, int) and 1 <= label_one_based <= self.num_classes:
+                self.labels_0based.append(label_one_based - 1)
+            else:
+                logger.error(f"硬编码列表中的标签 {label_one_based} 无效 (file: {item.get('file_name')})，期望范围 [1, {self.num_classes}]。将标记为-1。")
+                self.labels_0based.append(-1)
+
+        self.data_from_json = []
+        self._load_json_data_to_memory() # 在初始化时加载所有JSON数据
+
+        # 打印标签分布统计 (与v1.4一致)
+        if self.labels_0based:
+            valid_labels_for_stats = [lbl for lbl in self.labels_0based if lbl != -1]
+            if valid_labels_for_stats:
+                unique_labels, counts = np.unique(valid_labels_for_stats, return_counts=True)
+                label_counts_dict = dict(zip(unique_labels, counts))
+                full_label_distribution = {i: label_counts_dict.get(i, 0) for i in range(self.num_classes)}
+                logger.info(f"  '{self.train_val_flag}' split 样本总数 (来自硬编码列表): {len(self.data_dict_raw)}")
+                logger.info(f"  成功加载到内存的骨骼数据样本数: {sum(1 for d in self.data_from_json if d is not None)}")
+                logger.info(f"  有效标签分布 (0-based): {full_label_distribution}")
+                missing_or_zero_count_labels = [lbl for lbl, count in full_label_distribution.items() if count == 0]
+                if missing_or_zero_count_labels:
+                    logger.warning(f"  警告: 以下类别在 '{self.train_val_flag}' 数据集中有效样本数量为0: {missing_or_zero_count_labels}")
+            else: logger.warning(f"  '{self.train_val_flag}' split 没有有效的标签用于统计分布。")
+        else: logger.error(f"错误: '{self.train_val_flag}' split 的标签列表 (self.labels_0based) 为空！")
 
         if self.debug:
-            logger.warning(f"!!! DEBUG 模式开启，只使用前 100 个样本 !!!")
-            self.sample_info = self.sample_info[:100]
-            self.label = self.label[:100]
+            debug_limit = 10
+            logger.warning(f"!!! DEBUG 模式开启，只使用前 {debug_limit} 个样本 !!!")
+            self.data_dict_raw = self.data_dict_raw[:debug_limit]
+            self.labels_0based = self.labels_0based[:debug_limit]
+            self.data_from_json = self.data_from_json[:debug_limit]
 
-        logger.info(f"成功加载 {len(self.sample_info)} 个样本用于 '{self.train_val}' split。")
-
-    def _load_data(self):
-        """根据 split 加载数据信息和标签"""
-        if self.split == 'train':
-            self._load_train_samples_and_labels_from_json()
-        else: # 'val' or 'test'
-            self._load_val_samples_and_labels_from_pkl()
-
-    def _load_train_samples_and_labels_from_json(self):
-        """扫描 root_dir，根据文件名划分视角，从 JSON 文件内部读取标签 (用于训练集)。"""
-        logger.info(f"扫描目录 '{self.root_dir}' 并根据视角划分训练样本 (View 1 & 2)，从 JSON 读取标签...")
-        json_files_pattern = os.path.join(self.root_dir, 'a*_s*_e*_v*.json')
-        json_files = glob.glob(json_files_pattern)
-        if not json_files: logger.error(f"在 '{self.root_dir}' 中找不到任何符合模式 'aX*_sX*_eX*_vX*.json' 的 JSON 文件。"); return
-
-        self.sample_info = []
-        self.label = []
-        loaded_count = 0; skipped_json_error = 0; skipped_label_error = 0
-        skipped_view = 0; skipped_parsing = 0; debug_limit = 50
-
-        logger.info(f"找到 {len(json_files)} 个潜在 JSON 文件，开始解析...")
-        for filepath in sorted(json_files):
-            filename = os.path.basename(filepath)
-            sample_id = filename.replace('.json', '')
+    def _load_json_data_to_memory(self):
+        """遍历硬编码的 data_dict_raw, 从 JSON 文件加载骨骼数据到 self.data_from_json"""
+        logger.info(f"开始为 '{self.train_val_flag}' split 将所有JSON数据加载到内存...")
+        for item_info in tqdm(self.data_dict_raw, desc=f"Loading JSONs for {self.train_val_flag}"):
+            file_name = item_info.get('file_name')
+            if not file_name:
+                self.data_from_json.append(None); logger.warning(f"条目缺少 file_name: {item_info}"); continue
+            
+            json_path = os.path.join(self.root_dir, file_name + '.json')
             try:
-                parts = sample_id.split('_'); view_part = parts[-1]
-                if len(parts) != 4 or not view_part.startswith('v') or not view_part[1:].isdigit(): raise ValueError("文件名或视角部分格式错误")
-                view_id = int(view_part[1:])
-            except Exception as e:
-                if skipped_parsing < debug_limit: logger.warning(f"[解析失败] 文件名 '{filename}' 无法解析视角ID ({e})，跳过。")
-                skipped_parsing += 1; continue
+                with open(json_path, 'r') as f: json_file_content = json.load(f)
+                skeletons_data = json_file_content.get('skeletons') if isinstance(json_file_content, dict) else (json_file_content if isinstance(json_file_content, list) else None)
+                if skeletons_data and isinstance(skeletons_data, list):
+                    processed_frames = []; zero_frame = np.zeros((self.num_nodes, self.base_channel), dtype=np.float32)
+                    for frame_data_list in skeletons_data:
+                        if isinstance(frame_data_list, list) and len(frame_data_list) == self.num_nodes:
+                            current_frame_joints = []; valid_frame = True
+                            for joint_coords_list in frame_data_list:
+                                if isinstance(joint_coords_list, list) and len(joint_coords_list) == self.base_channel and all(isinstance(c, (float, int)) and math.isfinite(c) for c in joint_coords_list):
+                                    current_frame_joints.append(joint_coords_list)
+                                else:
+                                    valid_frame = False; break
+                            if valid_frame:
+                                processed_frames.append(current_frame_joints)
+                            else:
+                                processed_frames.append(zero_frame.copy())
+                        else:
+                             processed_frames.append(zero_frame.copy())
+                    
+                    if processed_frames:
+                        value_np = np.array(processed_frames, dtype=np.float32)
+                        if value_np.ndim == 3 and value_np.shape[1] == self.num_nodes and value_np.shape[2] == self.base_channel:
+                            self.data_from_json.append(value_np)
+                        else: self.data_from_json.append(None); logger.warning(f"从 {json_path} 加载的数据维度不正确: {value_np.shape if hasattr(value_np, 'shape') else '未知'}，期望 (T, {self.num_nodes}, {self.base_channel})")
+                    else: self.data_from_json.append(None); logger.warning(f"从 {json_path} 未能提取有效帧数据。")
+                else: self.data_from_json.append(None); logger.warning(f"JSON文件 {json_path} 结构不符合预期或 'skeletons' 为空或非列表。")
+            except FileNotFoundError: self.data_from_json.append(None); logger.error(f"JSON 文件未找到: {json_path}")
+            except Exception as e: self.data_from_json.append(None); logger.error(f"加载或解析 JSON {json_path} 失败: {e}", exc_info=self.debug)
 
-            is_train_sample = view_id == 1 or view_id == 2
-            if not is_train_sample:
-                if skipped_view < debug_limit: pass # logger.debug(...)
-                skipped_view += 1; continue
+    def _rand_view_transform(self, skeleton_data, agx_range=(-60, 60), agy_range=(-60, 60), s_range=(0.5, 1.5)):
+        if skeleton_data.shape[-1] != self.base_channel or self.base_channel != 3: # 确保只对原始3D坐标应用
+            logger.warning(f"_rand_view_transform 期望输入为3通道，但得到 {skeleton_data.shape[-1]}。跳过变换。")
+            return skeleton_data
+        agx = random.uniform(agx_range[0], agx_range[1])
+        agy = random.uniform(agy_range[0], agy_range[1])
+        s = random.uniform(s_range[0], s_range[1])
 
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f: json_data = json.load(f)
-                label_key = "label"; possible_keys = ["action_id", "action_label", "category_id"]; label_orig = None
-                if label_key in json_data: label_orig = json_data[label_key]
-                else:
-                    for pk in possible_keys:
-                        if pk in json_data: label_key = pk; label_orig = json_data[label_key]; break
-                if label_orig is None: raise KeyError(f"JSON 文件中找不到标签键 '{label_key}' 或 {possible_keys}")
-                if not isinstance(label_orig, int): raise TypeError(f"标签值 '{label_orig}' 不是整数")
-                if not (1 <= label_orig <= self.num_classes):
-                    if skipped_label_error < debug_limit: logger.warning(f"[跳过 - JSON标签超范围] 文件: {filename}, JSON标签 {label_orig} 超出范围 [1, {self.num_classes}]")
-                    skipped_label_error += 1; continue
+        agx_rad = math.radians(agx)
+        agy_rad = math.radians(agy)
+        Rx = np.array([[1,0,0], [0,math.cos(agx_rad),math.sin(agx_rad)], [0,-math.sin(agx_rad),math.cos(agx_rad)]], dtype=skeleton_data.dtype)
+        Ry = np.array([[math.cos(agy_rad),0,-math.sin(agy_rad)], [0,1,0], [math.sin(agy_rad),0,math.cos(agy_rad)]], dtype=skeleton_data.dtype)
+        Ss = np.diag([s,s,s]).astype(skeleton_data.dtype)
+        
+        original_shape = skeleton_data.shape
+        transformed_data = np.dot(skeleton_data.reshape(-1, self.base_channel), Ry @ Rx @ Ss)
+        return transformed_data.reshape(original_shape)
 
-                final_label = label_orig - 1
-                self.sample_info.append({'path': filepath, 'id': sample_id})
-                self.label.append(final_label)
-                loaded_count += 1
-                # if self.debug and loaded_count <= debug_limit: print(...) # 减少打印
+    def _apply_gaussian_noise(self, skeleton_data, level=0.01):
+        noise = np.random.normal(scale=level, size=skeleton_data.shape).astype(skeleton_data.dtype)
+        return skeleton_data + noise
 
-            except Exception as e:
-                 if skipped_json_error < debug_limit or skipped_label_error < debug_limit : logger.warning(f"[跳过 - JSON/标签错误] 文件: {filename}, 原因: {e}")
-                 if isinstance(e, (FileNotFoundError, json.JSONDecodeError)): skipped_json_error += 1
-                 else: skipped_label_error += 1
-                 continue
-
-        logger.info(f"训练样本扫描完毕。成功加载: {loaded_count}。跳过(JSON错误 {skipped_json_error}, 标签错误 {skipped_label_error}, 非训练视角 {skipped_view}, 解析失败 {skipped_parsing})。")
-        if loaded_count == 0: logger.error("错误：没有加载到任何有效的训练样本！")
-
-
-    def _load_val_samples_and_labels_from_pkl(self):
-        """从 pkl 文件加载验证集/测试集样本信息和标签。"""
-        logger.info(f"从 pkl 文件加载验证/测试集样本和标签: {self.val_pkl_path}")
-        if not os.path.exists(self.val_pkl_path): logger.error(f"PKL 文件未找到: {self.val_pkl_path}"); return
-        try:
-            with open(self.val_pkl_path, 'rb') as f: pkl_data_raw = pickle.load(f)
-            pkl_data = []
-            # (保持对不同 PKL 格式的兼容处理)
-            if isinstance(pkl_data_raw, list) and pkl_data_raw and isinstance(pkl_data_raw[0], dict) and 'file_name' in pkl_data_raw[0] and 'label' in pkl_data_raw[0]: pkl_data = pkl_data_raw
-            elif isinstance(pkl_data_raw, dict):
-                 if all(isinstance(k, str) and isinstance(v, int) for k, v in pkl_data_raw.items()): pkl_data = [{'file_name': k, 'label': v} for k, v in pkl_data_raw.items()]
-                 elif pkl_data_raw and isinstance(list(pkl_data_raw.values())[0], dict) and 'label' in list(pkl_data_raw.values())[0]: pkl_data = [{'file_name': k, 'label': v['label']} for k, v in pkl_data_raw.items()]
-                 else: logger.error(f"无法识别的 PKL 字典格式 in {self.val_pkl_path}"); return
-            else: logger.error(f"无法识别的 PKL 文件格式 in {self.val_pkl_path}"); return
-            if not pkl_data: logger.error(f"从 PKL 加载/解析后数据为空: {self.val_pkl_path}"); return
-
-            self.sample_info = []; self.label = []
-            loaded_count = 0; skipped_count = 0; missing_files = 0; debug_limit = 50
-            for item in pkl_data:
-                file_name = item.get('file_name'); label_orig = item.get('label')
-                if file_name is None or label_orig is None: skipped_count += 1; continue
-                if not isinstance(label_orig, int): skipped_count += 1; continue
-                if not (1 <= label_orig <= self.num_classes):
-                    if skipped_count < 10 or self.debug: logger.warning(f"PKL 标签无效: {label_orig} for {file_name}，跳过！")
-                    skipped_count += 1; continue
-                json_file_path = os.path.join(self.root_dir, f"{file_name}.json")
-                if os.path.exists(json_file_path):
-                     self.sample_info.append({'path': json_file_path, 'id': file_name})
-                     final_label = label_orig - 1
-                     if not (0 <= final_label < self.num_classes): # Double check
-                          logger.error(f"内部错误：PKL标签转换后无效 {final_label} for {file_name}，跳过！")
-                          self.sample_info.pop(); skipped_count += 1; continue
-                     self.label.append(final_label)
-                     loaded_count += 1
-                     # if self.debug and loaded_count <= debug_limit: print(...) # Reduce print
-                else:
-                     if missing_files < 10: logger.warning(f"找不到验证/测试集 JSON 文件: {json_file_path}，跳过。")
-                     missing_files += 1; skipped_count += 1
-            logger.info(f"验证/测试样本加载完毕。加载: {loaded_count}, 跳过: {skipped_count} (缺失 JSON: {missing_files})。")
-            if loaded_count == 0: logger.error("错误：没有加载到任何有效的验证/测试样本！")
-        except Exception as e: logger.error(f"加载或处理 PKL 文件 '{self.val_pkl_path}' 失败: {e}", exc_info=True)
-
-    def rand_view_transform(self, X, agx, agy, s):
-        """应用随机视角变换"""
-        agx_rad = math.radians(agx); agy_rad = math.radians(agy)
-        Rx = np.asarray([[1,0,0], [0,math.cos(agx_rad),math.sin(agx_rad)], [0,-math.sin(agx_rad),math.cos(agx_rad)]])
-        Ry = np.asarray([[math.cos(agy_rad),0,-math.sin(agy_rad)], [0,1,0], [math.sin(agy_rad),0,math.cos(agy_rad)]])
-        Ss = np.asarray([[s,0,0],[0,s,0],[0,0,s]])
-        orig_shape = X.shape; C_dim = orig_shape[-1]
-        if C_dim != 3: return X
-        is_reshaped = False
-        if X.ndim > 2 : X = np.reshape(X,(-1,3)); is_reshaped = True
-        R = np.dot(Rx, Ry)
-        X_transformed = np.dot(X, np.dot(R, Ss))
-        if is_reshaped : X_transformed = np.reshape(X_transformed, orig_shape)
-        return X_transformed
-
-    def __getitem__(self, index):
-        """获取并处理单个样本，返回拼接后的多模态数据和标签"""
-        true_index = index % len(self.sample_info)
-        if true_index >= len(self.sample_info) or true_index >= len(self.label): return None
-
-        info = self.sample_info[true_index]
-        label = self.label[true_index] # 0-based label
-        json_file_path = info['path']
-        sample_id = info['id']
-
-        # --- 读取 JSON 数据 (获取骨骼坐标) ---
-        try:
-            with open(json_file_path, 'r', encoding='utf-8') as f: json_data = json.load(f)
-            frame_list_from_json = []
-            potential_keys = ['frames', 'data', 'skeletons']
-            for key in potential_keys:
-                if key in json_data and isinstance(json_data[key], list): frame_list_from_json = json_data[key]; break
-            if not frame_list_from_json and isinstance(json_data, list): frame_list_from_json = json_data
-            if not frame_list_from_json: raise ValueError("JSON 数据列表为空")
-        except Exception as e: return None # 让 collate_fn 处理
-
-        # --- 提取基础关节序列 (data_numpy) ---
-        skeleton_sequence = []
-        for frame_idx, frame_info in enumerate(frame_list_from_json):
-            skeletons = []; target_skeleton = None; joints = []
-            if isinstance(frame_info, dict):
-                skeletons = frame_info.get('skeletons', [])
-                if not skeletons and 'joints' in frame_info: skeletons = [frame_info]
-            elif isinstance(frame_info, list): skeletons = [{'joints': frame_info}]
-            if skeletons: target_skeleton = skeletons[0]; joints = target_skeleton.get('joints', [])
-            if not isinstance(joints, list): joints = []
-            current_frame_joints_np = None
-            if len(joints) == self.num_nodes:
-                 frame_joints_list = []; valid_frame = True
-                 for joint_idx, joint_info in enumerate(joints):
-                      pos = None
-                      if isinstance(joint_info, list) and len(joint_info) >= self.num_base_input_dim: pos = joint_info[:self.num_base_input_dim]
-                      elif isinstance(joint_info, dict):
-                           pos_candidate = joint_info.get('position', joint_info.get('pos'))
-                           if isinstance(pos_candidate, list) and len(pos_candidate) >= self.num_base_input_dim: pos = pos_candidate[:self.num_base_input_dim]
-                      if pos is None or not all(isinstance(c, (int, float)) and math.isfinite(c) for c in pos): valid_frame = False; break
-                      frame_joints_list.append(pos)
-                 if valid_frame:
-                     try: current_frame_joints_np = np.array(frame_joints_list, dtype=np.float32)
-                     except ValueError: valid_frame = False
-            if current_frame_joints_np is None or not valid_frame:
-                 if skeleton_sequence: skeleton_sequence.append(skeleton_sequence[-1])
-                 else: skeleton_sequence.append(np.zeros((self.num_nodes, self.num_base_input_dim), dtype=np.float32))
-            else: skeleton_sequence.append(current_frame_joints_np)
-        if not skeleton_sequence: return None
-        try:
-            data_numpy = np.stack(skeleton_sequence, axis=0) # (T_orig, N, C_base)
-            if not np.all(np.isfinite(data_numpy)): data_numpy = np.nan_to_num(data_numpy, nan=0.0, posinf=0.0, neginf=0.0)
-            if not np.all(np.isfinite(data_numpy)): return None
-        except Exception as e: return None
-
-        # --- 数据预处理和增强 (应用在原始 joint 数据上) ---
-        # 1. 中心化
-        if self.center_joint_idx is not None: # 检查是否为 None
-            if data_numpy.shape[0] > 0 and data_numpy.shape[1] > self.center_joint_idx:
-                center = data_numpy[:, self.center_joint_idx:self.center_joint_idx+1, :]
-                data_numpy = data_numpy - center
-
-        # 2. 应用数据增强 (只在训练时)
-        if self.train_val == 'train':
-            apply_stronger_aug = self.augment_confused_classes and (label in self.confused_classes_set)
-
-            # 2.a 随机视角变换
-            if self.apply_rand_view_transform:
-                if apply_stronger_aug: # 对特定类别应用更强的变换
-                    rot_range = self.confused_rotation_range; scale_range = self.confused_scale_range
-                else: # 默认变换范围
-                    rot_range = (-60, 60); scale_range = (0.5, 1.5)
-                agx = random.randint(rot_range[0], rot_range[1])
-                agy = random.randint(rot_range[0], rot_range[1])
-                s = random.uniform(scale_range[0], scale_range[1])
-                if data_numpy.shape[0] > 0 and data_numpy.shape[-1] == 3:
-                    data_numpy = self.rand_view_transform(data_numpy, agx, agy, s)
-
-            # 2.b 对易混淆类别添加高斯噪声 (可选)
-            if apply_stronger_aug and self.add_gaussian_noise and self.gaussian_noise_level > 0:
-                noise = np.random.normal(scale=self.gaussian_noise_level, size=data_numpy.shape)
-                data_numpy = data_numpy + noise.astype(data_numpy.dtype)
-
-            # 2.c 在这里可以添加其他训练时增强, e.g., Joint Dropout
-            # if apply_stronger_aug and self.apply_joint_dropout:
-            #    data_numpy = self.random_joint_dropout(data_numpy, p=0.1)
-
-        # --- 根据请求的模态计算并拼接 ---
-        modal_data_list = []
-        data_bone = None # 缓存 bone
-        try:
-            for modality in self.modalities:
-                if modality == 'joint': modal_data_list.append(data_numpy.copy())
-                elif modality == 'bone':
-                    if data_bone is None: data_bone = joint_to_bone(data_numpy, self.bone_pairs, self.num_nodes)
-                    modal_data_list.append(data_bone.copy())
-                elif modality == 'joint_motion': modal_data_list.append(joint_to_motion(data_numpy))
-                elif modality == 'bone_motion':
-                    if data_bone is None: data_bone = joint_to_bone(data_numpy, self.bone_pairs, self.num_nodes)
-                    modal_data_list.append(joint_to_motion(data_bone))
-            if not modal_data_list: return None # 没有有效模态
-            data_concatenated = np.concatenate(modal_data_list, axis=-1) # (T_orig, N, C_total)
-        except Exception as e: # 捕捉计算或拼接中的错误
-            # logger.error(f"样本 {sample_id}: 计算或拼接模态时出错: {e}")
-            return None
-
-        # --- 时间步采样/插值 和 Padding ---
-        data_sampled = self.temporal_windowing(data_concatenated, sample_id)
-        if data_sampled is None or data_sampled.size == 0: return None
-
-        # *** 确保 pad_sequence 处理的是正确维度的数组 ***
-        data_padded, mask_np = pad_sequence(data_sampled, self.max_len)
-
-        # --- 转换为 Tensor ---
-        try:
-            x_tensor = torch.from_numpy(data_padded).float()
-            label_tensor = torch.tensor(label, dtype=torch.long)
-            mask_tensor = torch.from_numpy(mask_np).bool()
-        except Exception as e: return None
-
-        return x_tensor, label_tensor, mask_tensor, true_index
-
-
-    def temporal_windowing(self, data_numpy, sample_id_for_debug):
-        """处理时间维度：采样或保持原样，交由 pad_sequence 处理最终长度"""
-        if data_numpy is None or data_numpy.shape[0] == 0: return None # 处理空输入
+    def _temporal_sampling(self, data_numpy, target_len):
+        """
+        时间采样逻辑。
+        如果原始长度 <= 目标长度，则不进行采样，后续由 pad_sequence 填充。
+        如果原始长度 > 目标长度，则根据 self.random_choose_flag 进行采样。
+        """
         T_orig = data_numpy.shape[0]
-        target_len = self.max_len
-        if target_len <= 0: return data_numpy
-        if T_orig == target_len: return data_numpy
-        elif T_orig < target_len: return data_numpy # 由 pad_sequence 填充
+        if T_orig == 0:
+            # 返回一个正确形状的全零数组，通道数应为 data_numpy 的实际通道数
+            num_channels_local = data_numpy.shape[-1] if data_numpy.ndim == 3 and data_numpy.size > 0 else self.base_channel
+            return np.zeros((target_len, self.num_nodes, num_channels_local), dtype=np.float32)
+        
+        if T_orig <= target_len:
+            # 不需要采样，后续由 pad_sequence 负责填充到 target_len
+            return data_numpy
         else: # T_orig > target_len
-            if self.train_val == 'train' and self.random_choose:
-                indices_pool = list(np.arange(T_orig))
-                k = min(target_len, T_orig)
-                if k <= 0: return None
-                random_idx = random.sample(indices_pool, k); random_idx.sort()
-                return data_numpy[random_idx, :, :]
-            else:
-                idx = np.linspace(0, T_orig - 1, target_len).round().astype(int)
-                idx = np.clip(idx, 0, T_orig - 1)
-                return data_numpy[idx, :, :]
+            if self.random_choose_for_sampling: # 使用 __init__ 中定义的属性
+                indices = random.sample(range(T_orig), target_len)
+                indices.sort()
+                return data_numpy[indices, :, :]
+            else: # 验证/测试 或 训练时不随机选择
+                indices = np.linspace(0, T_orig - 1, target_len).round().astype(np.int_)
+                indices = np.clip(indices, 0, T_orig - 1) # 确保索引有效
+                return data_numpy[indices, :, :]
 
     def __len__(self):
-        return len(self.sample_info) * self.repeat
+        return len(self.data_dict_raw) * self.repeat if self.data_dict_raw else 0
 
-    def top_k(self, score, top_k):
-        pass # 通常在 Processor 中计算
+    def __getitem__(self, index):
+        true_index = index % len(self.data_dict_raw)
+        
+        # 首先检查标签是否有效，如果无效，则此样本不应被使用
+        label_0based = self.labels_0based[true_index]
+        sample_id_for_debug = self.data_dict_raw[true_index].get('file_name', f"unknown_idx_{true_index}")
 
-# (单元测试代码保持不变，或根据需要更新)
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    logger.info("测试 Feeder (支持多模态拼接和类别相关增强)...")
+        if label_0based == -1: # 在 __init__ 中被标记为无效标签
+            logger.warning(f"样本 {sample_id_for_debug} (原始索引 {true_index}) 因其硬编码标签无效而被跳过。")
+            return None # 返回 None，让 collate_fn 过滤
 
-    # --- !!! 修改为你本地 NW-UCLA 数据集的实际根目录和 PKL 文件路径 !!! ---
-    test_root_dir = '/path/to/your/nw-ucla/data-json' # <--- 修改 JSON 文件所在目录
-    test_val_pkl = '/path/to/your/nw-ucla/val_label.pkl' # <--- 修改验证集 PKL 文件路径
+        # 从内存中获取原始 joint 数据
+        joint_data_orig_from_mem = self.data_from_json[true_index]
 
-    if not os.path.isdir(test_root_dir):
-         logger.error(f"测试根目录无效: {test_root_dir}"); sys.exit(1)
-    # if not os.path.exists(test_val_pkl): logger.warning(f"测试 PKL 文件无效: {test_val_pkl}") # 只警告
+        if joint_data_orig_from_mem is None: # JSON数据加载失败或为空
+            logger.warning(f"样本 {sample_id_for_debug} (原始索引 {true_index}) 的骨骼数据为 None (可能JSON加载失败)。将被跳过。")
+            return None # 返回 None，让 collate_fn 过滤
 
-    def collate_fn_filter_none(batch):
-        batch = [item for item in batch if item is not None]
-        if not batch: return None
+        # --- 从这里开始是正常的样本处理逻辑 ---
         try:
-             xs = torch.stack([item[0] for item in batch], 0)
-             ls = torch.stack([item[1] for item in batch], 0)
-             ms = torch.stack([item[2] for item in batch], 0)
-             idxs = torch.tensor([item[3] for item in batch], dtype=torch.long)
-             return xs, ls, ms, idxs
+            current_joint_data = joint_data_orig_from_mem.copy()
+
+            # 1. 中心化
+            if self.center_joint_idx is not None and 0 <= self.center_joint_idx < self.num_nodes and current_joint_data.shape[0] > 0:
+                center_coord = current_joint_data[0, self.center_joint_idx, :].copy()
+                current_joint_data = current_joint_data - center_coord
+            
+            # 2. 数据增强 (仅训练时)
+            if self.train_val_flag == 'train':
+                apply_stronger_aug = self.augment_confused_classes and (label_0based in self.confused_classes_set)
+                if self.apply_rand_view_transform:
+                    rot_range = self.confused_rotation_range if apply_stronger_aug else (-60,60)
+                    scale_range = self.confused_scale_range if apply_stronger_aug else (0.5,1.5)
+                    current_joint_data = self._rand_view_transform(current_joint_data, agx_range=rot_range, agy_range=rot_range, s_range=scale_range)
+                if apply_stronger_aug and self.add_gaussian_noise and self.gaussian_noise_level > 0:
+                    current_joint_data = self._apply_gaussian_noise(current_joint_data, level=self.gaussian_noise_level)
+                
+                if self.apply_normalization: # 样本内 Min-Max 标准化
+                    temp_shape = current_joint_data.shape
+                    if temp_shape[0] > 0 :
+                        jd_flat = current_joint_data.reshape(-1, self.base_channel)
+                        min_v, max_v = np.min(jd_flat, axis=0, keepdims=True), np.max(jd_flat, axis=0, keepdims=True)
+                        range_v = max_v - min_v; range_v[range_v == 0] = 1e-6
+                        jd_flat_norm = (jd_flat - min_v) / range_v
+                        jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
+                        current_joint_data = jd_flat_scaled.reshape(temp_shape)
+            else: # 验证/测试集
+                if self.apply_normalization:
+                    temp_shape = current_joint_data.shape
+                    if temp_shape[0] > 0:
+                        jd_flat = current_joint_data.reshape(-1, self.base_channel)
+                        min_v, max_v = np.min(jd_flat, axis=0, keepdims=True), np.max(jd_flat, axis=0, keepdims=True)
+                        range_v = max_v - min_v; range_v[range_v == 0] = 1e-6
+                        jd_flat_norm = (jd_flat - min_v) / range_v
+                        jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
+                        current_joint_data = jd_flat_scaled.reshape(temp_shape)
+
+            # 3. 时间采样
+            joint_data_sampled = self._temporal_sampling(current_joint_data, self.target_seq_len)
+            if joint_data_sampled is None or joint_data_sampled.shape[0] == 0 : # 再次检查采样结果
+                logger.warning(f"样本 {sample_id_for_debug} 时间采样后数据为空或长度为0。将被跳过。")
+                return None
+
+            # 4. 计算衍生模态和拼接
+            modal_data_list = []
+            # 确保 joint_data_sampled 是3D的并且有正确的 base_channel
+            if joint_data_sampled.ndim != 3 or joint_data_sampled.shape[-1] != self.base_channel:
+                 logger.error(f"样本 {sample_id_for_debug}: 用于衍生模态计算的 joint_data_sampled 维度 ({joint_data_sampled.shape}) 或通道数 ({joint_data_sampled.shape[-1] if joint_data_sampled.ndim==3 else 'N/A'}) 与期望的 (T, N, {self.base_channel}) 不符。将被跳过。")
+                 return None
+
+            data_bone_sampled = None
+            for modality in self.modalities:
+                if modality == 'joint':
+                    modal_data_list.append(joint_data_sampled.copy())
+                elif modality == 'bone':
+                    data_bone_sampled = joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
+                    modal_data_list.append(data_bone_sampled)
+                elif modality == 'joint_motion':
+                    modal_data_list.append(joint_to_motion(joint_data_sampled))
+                elif modality == 'bone_motion':
+                    if data_bone_sampled is None: # 确保骨骼数据已计算
+                         data_bone_sampled = joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
+                    modal_data_list.append(joint_to_motion(data_bone_sampled))
+            
+            if not modal_data_list:
+                 logger.warning(f"样本 {sample_id_for_debug}: 没有生成任何有效模态。将被跳过。")
+                 return None
+
+            data_concatenated = np.concatenate(modal_data_list, axis=-1)
+            
+            if data_concatenated.shape[-1] != self.num_input_dim:
+                logger.error(f"样本 {sample_id_for_debug}: 拼接后通道数 ({data_concatenated.shape[-1]}) 与预期的总输入维度 ({self.num_input_dim}) 不符。Modalities: {self.modalities}。将被跳过。")
+                return None
+
+            # 5. Padding 和 Mask
+            data_padded, mask_np = pad_sequence(data_concatenated, self.target_seq_len, self.num_nodes, self.num_input_dim)
+
+            data_tensor = torch.from_numpy(data_padded).float()
+            label_tensor = torch.tensor(label_0based, dtype=torch.long) # label_0based 此时一定是有效的
+            mask_tensor = torch.from_numpy(mask_np).bool()
+
+            # 可选：最终检查标签范围，理论上这里不应该再出问题
+            # if not (0 <= label_tensor.item() < self.num_classes):
+            #     logger.critical(f"!!!!!! 内部逻辑错误：即将返回无效标签 !!!!!! 样本 ID: {sample_id_for_debug}, 标签: {label_tensor.item()}")
+            #     return None
+
+            return data_tensor, label_tensor, mask_tensor, true_index
+
         except Exception as e:
-             logger.error(f"CollateFn 错误: {e}")
-             for i, item in enumerate(batch):
-                 try: logger.error(f" Item {i} shapes: {item[0].shape}, {item[1].shape}, {item[2].shape}, {type(item[3])}")
-                 except: logger.error(f" Item {i} is problematic: {item}")
-             return None
+            logger.error(f"在 __getitem__ 中处理样本 (ID: {sample_id_for_debug}, 索引 {true_index}) 时发生未捕获的异常: {e}", exc_info=True)
+            return None # 任何未预料的错误也返回 None
 
-    try:
-        # --- 测试训练集加载 (joint, bone) ---
-        logger.info("\n--- 测试训练集 (joint, bone) ---")
-        train_feeder_jb_args = {
-            'root_dir': test_root_dir, 'split': 'train', 'data_path': 'joint,bone',
-            'max_len': 100, 'num_classes': 10, 'debug': True, 'apply_rand_view_transform': True
-        }
-        train_feeder_jb = Feeder(**train_feeder_jb_args)
-        logger.info(f"训练集 (joint, bone) 样本数: {len(train_feeder_jb)}")
-        logger.info(f"预期输入维度: {train_feeder_jb.num_input_dim}")
-        if len(train_feeder_jb.sample_info) > 0:
-            item1 = train_feeder_jb[0]
-            if item1:
-                 x1, l1, m1, idx1 = item1
-                 logger.info(f"样本 {idx1} - X shape: {x1.shape}, Label: {l1.item()}, Mask sum: {m1.sum().item()}")
-                 assert x1.shape == (100, 20, 6)
-            else: logger.warning("第一个样本加载失败")
-            train_loader_jb = DataLoader(train_feeder_jb, batch_size=4, shuffle=True, num_workers=0, collate_fn=collate_fn_filter_none)
-            batch1 = next(iter(train_loader_jb), None)
-            if batch1:
-                xb, lb, mb, idxb = batch1
-                logger.info(f"Batch X shape: {xb.shape}, Label shape: {lb.shape}, Mask shape: {mb.shape}")
-                assert xb.shape == (4, 100, 20, 6)
-            else: logger.warning("批次为空")
+    def top_k(self, score, top_k_val): # 修改参数名以避免与实例变量冲突
+        valid_labels_for_topk = [lbl for lbl in self.labels_0based if lbl != -1]
+        # 确保 rank 是计算出来的
+        if not isinstance(score, np.ndarray): score = np.array(score) # 确保 score 是 numpy array
+        if score.ndim == 1: score = score.reshape(1, -1) # 如果是一维的单个样本分数，调整为二维
+        
+        # 确保 num_to_compare 与 score 的行数一致
+        num_to_compare = min(score.shape[0], len(valid_labels_for_topk))
+        if num_to_compare == 0: return 0.0
 
-        # --- 测试类别相关增强 ---
-        logger.info("\n--- 测试类别相关增强 ---")
-        confused_args = {
-            'root_dir': test_root_dir, 'split': 'train', 'data_path': 'joint', 'max_len': 64,
-            'num_classes': 10, 'debug': True, 'apply_rand_view_transform': True,
-            'augment_confused_classes': True, 'confused_classes_list': [0, 8],
-            'confused_rotation_range': (-90, 90), 'confused_scale_range': (0.1, 2.0),
-            'add_gaussian_noise': True, 'gaussian_noise_level': 0.1
-        }
-        feeder_aug = Feeder(**confused_args)
-        logger.info(f"类别增强 Feeder 样本数: {len(feeder_aug)}")
-        if len(feeder_aug.sample_info) > 0:
-             idx_cls0, idx_cls8, idx_other = -1, -1, -1
-             for i in range(len(feeder_aug.label)):
-                 lbl = feeder_aug.label[i]
-                 if lbl == 0 and idx_cls0 == -1: idx_cls0 = i
-                 elif lbl == 8 and idx_cls8 == -1: idx_cls8 = i
-                 elif lbl not in [0, 8] and idx_other == -1: idx_other = i
-                 if idx_cls0 != -1 and idx_cls8 != -1 and idx_other != -1: break
-             print(f"找到用于测试增强的索引: cls0={idx_cls0}, cls8={idx_cls8}, other={idx_other}")
-             if idx_cls0 != -1: item0 = feeder_aug[idx_cls0]; print(f" 类别 0 样本加载成功") if item0 else print(" 类别 0 样本加载失败")
-             if idx_cls8 != -1: item8 = feeder_aug[idx_cls8]; print(f" 类别 8 样本加载成功") if item8 else print(" 类别 8 样本加载失败")
-             if idx_other != -1: item_other = feeder_aug[idx_other]; print(f" 其他类别 ( {feeder_aug.label[idx_other]} ) 样本加载成功") if item_other else print(" 其他类别样本加载失败")
+        # argsort 默认升序, [:, ::-1] 将其反转为降序
+        rank = score[:num_to_compare].argsort(axis=1)[:, ::-1] # 解注释并使用
 
-    except Exception as e:
-         logger.error(f"单元测试过程中出错: {e}", exc_info=True)
+        hit_top_k_count = 0 # <--- 改为局部变量
+        for i in range(num_to_compare):
+            if valid_labels_for_topk[i] in rank[i, :top_k_val]:
+                hit_top_k_count += 1 # <--- 使用局部变量
+
+        return hit_top_k_count * 1.0 / num_to_compare if num_to_compare > 0 else 0.0
+
