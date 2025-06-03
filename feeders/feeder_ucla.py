@@ -43,47 +43,33 @@ def pad_sequence(seq, max_len, num_nodes, num_channels, pad_value=0.0):
         mask = np.ones(max_len, dtype=bool)
     return padded_seq, mask
 
-def joint_to_bone(data_numpy, bone_pairs, num_nodes):
-    T, N, C_base = data_numpy.shape
-    if C_base != 3: # 确保只对原始3通道数据操作
-        raise ValueError(f"joint_to_bone 期望输入数据有3个通道，但得到 {C_base} 个。请确保传递的是原始joint数据。")
-    data_bone = np.zeros_like(data_numpy)
-    for v1, v2 in bone_pairs: # bone_pairs 应该是 1-based
-        idx1, idx2 = v1 - 1, v2 - 1
-        if 0 <= idx1 < num_nodes and 0 <= idx2 < num_nodes:
-            data_bone[:, idx1, :] = data_numpy[:, idx1, :] - data_numpy[:, idx2, :]
-    return data_bone
-
-def joint_to_motion(data_numpy):
-    data_motion = np.zeros_like(data_numpy)
-    T = data_numpy.shape[0]
-    if T > 1:
-        data_motion[:T-1, :, :] = data_numpy[1:, :, :] - data_numpy[:-1, :, :]
-        data_motion[T-1, :, :] = data_motion[T-2, :, :]
-    return data_motion
-
 class Feeder(Dataset):
     def __init__(self,
                  root_dir,
                  split,
-                 data_path,
+                 data_path,  # 这个在单模态后期融合设置下，应该是单一模态名称字符串
                  max_len,
                  num_classes=10,
+                 num_nodes=20,
                  base_channel=3,
                  repeat=1,
-                 random_choose=False, # 这个参数现在用于控制 _temporal_sampling 的行为
+                 random_choose=False,
                  center_joint_idx=1,
                  apply_rand_view_transform=False,
+                 rand_view_rotation_range=(-60, 60), 
+                 rand_view_scale_range=(0.8, 1.2), # 保持一个默认值，YAML会覆盖
                  augment_confused_classes=False,
                  confused_classes_list=None,
                  confused_rotation_range=(-60, 60),
                  confused_scale_range=(0.5, 1.5),
                  add_gaussian_noise=False,
                  gaussian_noise_level=0.01,
+                 apply_random_flipping=False,
                  debug=False,
-                 label_path=None, # 用于辅助判断 train/val 来选择硬编码列表
+                 label_path=None,
                  window_size=-1,
                  normalization=False,
+                 modalities=None, # 新增一个 modalities 参数，main.py会传递
                  **kwargs):
         super().__init__()
 
@@ -91,59 +77,113 @@ class Feeder(Dataset):
             raise FileNotFoundError(f"Feeder错误: 原始 JSON 数据根目录 '{root_dir}' 未找到。")
 
         self.root_dir = root_dir
-        self.split = split
-        # 根据 split 和 label_path (如果提供) 来确定是训练还是验证模式，用于选择硬编码列表
-        if self.split.lower() in ['val', 'test']:
+        self.split = split.lower()
+
+        if self.split in ['val', 'test']:
             self.train_val_flag = 'val'
-        elif self.split.lower() == 'train':
+        elif self.split == 'train':
             self.train_val_flag = 'train'
-        elif label_path and 'val' in label_path.lower(): # Fallback for compatibility
+        elif label_path and 'val' in label_path.lower():
             self.train_val_flag = 'val'
             logger.warning(f"split 参数为 '{self.split}'，但 label_path ('{label_path}')包含'val'，将使用验证集列表。")
         else:
             self.train_val_flag = 'train'
-            if not (label_path and 'train' in label_path.lower()) and self.split.lower() not in ['train', 'val', 'test']:
+            if not (label_path and 'train' in label_path.lower()) and self.split not in ['train', 'val', 'test']:
                  logger.warning(f"split 参数 ('{self.split}') 和 label_path ('{label_path}') 都无法明确确定 train/val，默认为训练集。")
 
-        self.modalities_str = data_path
+        # --- 处理模态 ---
+        # data_path 参数现在是单一模态的名称，由 main.py 根据顶层 modalities 设置
+        self.current_modality = data_path.strip().lower() 
+        
+        # self.modalities 应该是一个列表，即使是单模态也应该是 ['modality_name']
+        # main.py 中设置 feeder_args['modalities'] = single_modality_name_for_feeder
+        # 所以这里需要确保它是一个列表
+        if modalities is not None:
+            if isinstance(modalities, str):
+                self.modalities = [m.strip().lower() for m in modalities.split(',') if m.strip()]
+            elif isinstance(modalities, list):
+                self.modalities = [str(m).strip().lower() for m in modalities]
+            else:
+                logger.warning(f"未知的 modalities 类型: {type(modalities)}，将使用 data_path 作为单模态。")
+                self.modalities = [self.current_modality]
+        else: # 如果 main.py 没有传递 modalities 参数 (不太可能，但作为后备)
+            self.modalities = [self.current_modality]
+
+        # 验证 self.current_modality 是否在 self.modalities 中 (理论上应该在)
+        if self.current_modality not in self.modalities:
+             logger.warning(f"当前处理模态 '{self.current_modality}' (来自data_path) 不在解析后的 modalities 列表 {self.modalities} 中。将以 current_modality 为准。")
+             # 如果是以 current_modality 为准进行单模态处理，那么 self.modalities 列表可以只包含它
+             self.modalities = [self.current_modality]
+
+
+        valid_modalities_set = {'joint', 'bone', 'joint_motion', 'bone_motion'}
+        for mod in self.modalities:
+            if mod not in valid_modalities_set:
+                raise ValueError(f"Feeder错误: 不支持的模态 '{mod}' 在列表 {self.modalities} 中。支持的模态: {valid_modalities_set}")
+        
         self.target_seq_len = max_len if max_len > 0 else (window_size if window_size > 0 else 64)
+        if self.target_seq_len <= 0: 
+            raise ValueError("Feeder错误: max_len 或 window_size 必须是正数。")
         self.max_len = self.target_seq_len
-        if self.target_seq_len <=0: raise ValueError("max_len 或 window_size 必须是正数")
 
         self.num_classes = num_classes
         self.base_channel = base_channel
+        # num_input_dim 现在根据实际要处理的 self.modalities 列表来计算
+        # 这使得 Feeder 既可以用于单模态（列表长度为1），也可以用于前期融合（列表长度大于1）
+        self.num_input_dim = self.base_channel * len(self.modalities) 
+
         self.repeat = repeat if self.train_val_flag == 'train' else 1
-        self.random_choose_for_sampling = random_choose if self.train_val_flag == 'train' else False # 重命名以区分
+        self.random_choose_for_sampling = random_choose if self.train_val_flag == 'train' else False
         self.center_joint_idx = center_joint_idx
+        
         self.apply_rand_view_transform = apply_rand_view_transform if self.train_val_flag == 'train' else False
         self.apply_normalization = normalization
-        self.debug = debug
+        self.add_gaussian_noise = add_gaussian_noise if self.train_val_flag == 'train' else False
+        self.apply_random_flipping = apply_random_flipping if self.train_val_flag == 'train' else False
 
-        self.num_nodes = 20
+        self.debug = debug
+        self.num_nodes = num_nodes
+        if self.num_nodes != 20:
+            logger.warning(f"Feeder警告: NW-UCLA数据集通常使用20个节点，但配置为 {self.num_nodes} 个节点。")
+        
         self.bone_pairs = [(1, 2), (2, 3), (3, 3), (4, 3), (5, 3), (6, 5), (7, 6), (8, 7), (9, 3), (10, 9), (11, 10),
                            (12, 11), (13, 1), (14, 13), (15, 14), (16, 15), (17, 1), (18, 17), (19, 18), (20, 19)]
-
-        if isinstance(self.modalities_str, str):
-            self.modalities = [m.strip().lower() for m in self.modalities_str.split(',') if m.strip()]
-        # ... (其余的 __init__ 参数设置和日志打印与 v1.6 相同) ...
-        else:
-            raise ValueError("Feeder的 data_path 必须是逗号分隔的字符串。")
-        valid_modalities = ['joint', 'bone', 'joint_motion', 'bone_motion']
-        for m in self.modalities:
-            if m not in valid_modalities: raise ValueError(f"不支持的数据模态: '{m}'. 支持: {valid_modalities}")
-        if not self.modalities: raise ValueError("必须至少指定一种数据模态 (data_path)")
-        self.num_input_dim = self.base_channel * len(self.modalities)
-
+        
+        # 确保这些属性被正确赋值
+        self.actual_rand_view_rotation_range = tuple(rand_view_rotation_range)
+        self.actual_rand_view_scale_range = tuple(rand_view_scale_range)
+        
         self.augment_confused_classes = augment_confused_classes if self.train_val_flag == 'train' else False
         self.confused_classes_set = set(confused_classes_list) if confused_classes_list else set()
-        self.confused_rotation_range = confused_rotation_range
-        self.confused_scale_range = confused_scale_range
-        self.add_gaussian_noise = add_gaussian_noise if self.train_val_flag == 'train' else False
+        self.actual_confused_rotation_range = tuple(confused_rotation_range) # 使用传入的参数
+        self.actual_confused_scale_range = tuple(confused_scale_range)     # 使用传入的参数
+
         self.gaussian_noise_level = gaussian_noise_level
 
-        logger.info(f"初始化 Feeder for NW-UCLA ({self.split} - 使用 '{self.train_val_flag}' 列表) - v1.7:")
+        # 定义左右对称的关节点对 (0-based index)
+        self.left_right_pairs = [
+            (4, 8), (5, 9), (6, 10), (7, 11),
+            (12, 16), (13, 17), (14, 18), (15, 19)
+        ]
+
+        logger.info(f"初始化 Feeder for NW-UCLA ({self.split} - '{self.train_val_flag}' list)")
+        logger.info(f"  处理模态 (self.modalities): {self.modalities}")
+        logger.info(f"  当前主要模态 (self.current_modality from data_path): {self.current_modality}")
         logger.info(f"  JSON 数据目录: {self.root_dir}")
-        logger.info(f"  加载模态: {self.modalities}, 总输入维度: {self.num_input_dim}")
+        logger.info(f"  目标序列长度: {self.target_seq_len}, 节点数: {self.num_nodes}, 基础通道数: {self.base_channel}, 总输出通道数: {self.num_input_dim}")
+        logger.info(f"  训练时重复次数: {self.repeat if self.train_val_flag == 'train' else 1}")
+        logger.info(f"  训练时随机采样帧: {self.random_choose_for_sampling}")
+        logger.info(f"  训练时随机视角变换: {self.apply_rand_view_transform}")
+        if self.apply_rand_view_transform:
+            logger.info(f"    通用旋转范围: {self.actual_rand_view_rotation_range}")
+            logger.info(f"    通用缩放范围: {self.actual_rand_view_scale_range}")
+        logger.info(f"  训练时特定类别增强: {self.augment_confused_classes}")
+        if self.augment_confused_classes:
+            logger.info(f"    混淆类别旋转范围: {self.actual_confused_rotation_range}")
+            logger.info(f"    混淆类别缩放范围: {self.actual_confused_scale_range}")
+        logger.info(f"  训练时高斯噪声: {self.add_gaussian_noise}, 水平: {self.gaussian_noise_level if self.add_gaussian_noise else 'N/A'}")
+        logger.info(f"  训练时随机翻转: {self.apply_random_flipping}")
+        logger.info(f"  Min-Max归一化: {self.apply_normalization}")
 
 
         # --- 硬编码样本列表 ---
@@ -192,61 +232,168 @@ class Feeder(Dataset):
             self.labels_0based = self.labels_0based[:debug_limit]
             self.data_from_json = self.data_from_json[:debug_limit]
 
-    def _load_json_data_to_memory(self):
-        """遍历硬编码的 data_dict_raw, 从 JSON 文件加载骨骼数据到 self.data_from_json"""
-        logger.info(f"开始为 '{self.train_val_flag}' split 将所有JSON数据加载到内存...")
-        for item_info in tqdm(self.data_dict_raw, desc=f"Loading JSONs for {self.train_val_flag}"):
-            file_name = item_info.get('file_name')
-            if not file_name:
-                self.data_from_json.append(None); logger.warning(f"条目缺少 file_name: {item_info}"); continue
-            
-            json_path = os.path.join(self.root_dir, file_name + '.json')
-            try:
-                with open(json_path, 'r') as f: json_file_content = json.load(f)
-                skeletons_data = json_file_content.get('skeletons') if isinstance(json_file_content, dict) else (json_file_content if isinstance(json_file_content, list) else None)
-                if skeletons_data and isinstance(skeletons_data, list):
-                    processed_frames = []; zero_frame = np.zeros((self.num_nodes, self.base_channel), dtype=np.float32)
-                    for frame_data_list in skeletons_data:
-                        if isinstance(frame_data_list, list) and len(frame_data_list) == self.num_nodes:
-                            current_frame_joints = []; valid_frame = True
-                            for joint_coords_list in frame_data_list:
-                                if isinstance(joint_coords_list, list) and len(joint_coords_list) == self.base_channel and all(isinstance(c, (float, int)) and math.isfinite(c) for c in joint_coords_list):
-                                    current_frame_joints.append(joint_coords_list)
-                                else:
-                                    valid_frame = False; break
-                            if valid_frame:
-                                processed_frames.append(current_frame_joints)
-                            else:
-                                processed_frames.append(zero_frame.copy())
-                        else:
-                             processed_frames.append(zero_frame.copy())
-                    
-                    if processed_frames:
-                        value_np = np.array(processed_frames, dtype=np.float32)
-                        if value_np.ndim == 3 and value_np.shape[1] == self.num_nodes and value_np.shape[2] == self.base_channel:
-                            self.data_from_json.append(value_np)
-                        else: self.data_from_json.append(None); logger.warning(f"从 {json_path} 加载的数据维度不正确: {value_np.shape if hasattr(value_np, 'shape') else '未知'}，期望 (T, {self.num_nodes}, {self.base_channel})")
-                    else: self.data_from_json.append(None); logger.warning(f"从 {json_path} 未能提取有效帧数据。")
-                else: self.data_from_json.append(None); logger.warning(f"JSON文件 {json_path} 结构不符合预期或 'skeletons' 为空或非列表。")
-            except FileNotFoundError: self.data_from_json.append(None); logger.error(f"JSON 文件未找到: {json_path}")
-            except Exception as e: self.data_from_json.append(None); logger.error(f"加载或解析 JSON {json_path} 失败: {e}", exc_info=self.debug)
+    def __getitem__(self, index):
+        # 计算在原始数据列表中的真实索引，考虑 repeat 参数
+        true_index = index % len(self.data_dict_raw)
+        
+        # 获取当前样本的0-based标签和用于调试的ID
+        label_0based = self.labels_0based[true_index]
+        sample_id_for_debug = self.data_dict_raw[true_index].get('file_name', f"unknown_idx_{true_index}")
 
-    def _rand_view_transform(self, skeleton_data, agx_range=(-60, 60), agy_range=(-60, 60), s_range=(0.5, 1.5)):
-        if skeleton_data.shape[-1] != self.base_channel or self.base_channel != 3: # 确保只对原始3D坐标应用
-            logger.warning(f"_rand_view_transform 期望输入为3通道，但得到 {skeleton_data.shape[-1]}。跳过变换。")
-            return skeleton_data
+        if label_0based == -1:
+            return None 
+
+        # --- 修改开始：使用 self.data_from_json ---
+        joint_data_orig_from_mem = self.data_from_json[true_index] 
+        # --- 修改结束 ---
+
+        if joint_data_orig_from_mem is None:
+            # 注意：如果 _load_json_data_to_memory 填充 self.data_from_json 时，
+            # 对于加载失败的条目也放入了 None，那么这里的检查是有效的。
+            logger.warning(f"Data for index {true_index} (file: {self.data_dict_raw[true_index].get('file_name')}) is None in self.data_from_json. Skipping.")
+            return None
+
+        try:
+            current_joint_data = joint_data_orig_from_mem.copy() # (T_orig, N, 3)
+
+            # 1. 中心化
+            if self.center_joint_idx is not None and \
+               0 <= self.center_joint_idx < self.num_nodes and \
+               current_joint_data.shape[0] > 0:
+                center_coord = current_joint_data[0, self.center_joint_idx, :].copy()
+                current_joint_data = current_joint_data - center_coord
+            
+            # 2. 数据增强 (训练时)
+            if self.train_val_flag == 'train':
+                apply_stronger_aug = self.augment_confused_classes and \
+                                     (label_0based in self.confused_classes_set)
+                
+                if self.apply_rand_view_transform:
+                    rot_range_to_use = self.actual_confused_rotation_range if apply_stronger_aug else self.actual_rand_view_rotation_range
+                    scale_range_to_use = self.actual_confused_scale_range if apply_stronger_aug else self.actual_rand_view_scale_range
+                    current_joint_data = self._rand_view_transform(
+                        current_joint_data,
+                        agx_range=rot_range_to_use,
+                        agy_range=rot_range_to_use,
+                        s_range=scale_range_to_use
+                    )
+                
+                if self.add_gaussian_noise and self.gaussian_noise_level > 0:
+                    current_joint_data = self._apply_gaussian_noise(
+                        current_joint_data,
+                        level=self.gaussian_noise_level
+                    )
+                
+                if hasattr(self, 'apply_random_flipping') and self.apply_random_flipping and random.random() > 0.5:
+                    if hasattr(self, '_perform_flipping'):
+                        current_joint_data = self._perform_flipping(current_joint_data)
+                    else:
+                        logger.warning("apply_random_flipping is True, but _perform_flipping method is not defined.")
+
+                if self.apply_normalization and current_joint_data.shape[0] > 0:
+                    temp_shape = current_joint_data.shape
+                    jd_flat = current_joint_data.reshape(-1, self.base_channel)
+                    min_v = np.min(jd_flat, axis=0, keepdims=True)
+                    max_v = np.max(jd_flat, axis=0, keepdims=True)
+                    range_v = max_v - min_v
+                    range_v[range_v == 0] = 1e-6
+                    jd_flat_norm = (jd_flat - min_v) / range_v
+                    jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
+                    current_joint_data = jd_flat_scaled.reshape(temp_shape)
+            else: # 验证/测试集
+                if self.apply_normalization and current_joint_data.shape[0] > 0:
+                    temp_shape = current_joint_data.shape
+                    jd_flat = current_joint_data.reshape(-1, self.base_channel)
+                    min_v = np.min(jd_flat, axis=0, keepdims=True)
+                    max_v = np.max(jd_flat, axis=0, keepdims=True)
+                    range_v = max_v - min_v
+                    range_v[range_v == 0] = 1e-6
+                    jd_flat_norm = (jd_flat - min_v) / range_v
+                    jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
+                    current_joint_data = jd_flat_scaled.reshape(temp_shape)
+
+            # 3. 时间采样
+            joint_data_sampled = self._temporal_sampling(current_joint_data, self.target_seq_len)
+            
+            if joint_data_sampled is None or joint_data_sampled.shape[0] == 0 :
+                logger.warning(f"样本 {sample_id_for_debug} 时间采样后数据为空或长度为0。将被跳过。")
+                return None
+
+            if joint_data_sampled.ndim != 3 or \
+               joint_data_sampled.shape[1] != self.num_nodes or \
+               joint_data_sampled.shape[2] != self.base_channel:
+                 logger.error(f"样本 {sample_id_for_debug}: 时间采样后的 joint_data_sampled 维度 ({joint_data_sampled.shape}) "
+                              f"的节点数或基础通道数与期望的 (T_actual/target, {self.num_nodes}, {self.base_channel}) 不符。将被跳过。")
+                 return None
+
+            # 4. 单模态数据生成 (基于 self.current_modality)
+            final_modal_data = None
+            modality_to_process = self.current_modality
+
+            if modality_to_process == 'joint':
+                final_modal_data = joint_data_sampled.copy()
+            elif modality_to_process == 'bone':
+                final_modal_data = self._joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
+            elif modality_to_process == 'joint_motion':
+                final_modal_data = self._joint_to_motion(joint_data_sampled)
+            elif modality_to_process == 'bone_motion':
+                bone_data_temp = self._joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
+                final_modal_data = self._joint_to_motion(bone_data_temp)
+            else:
+                logger.error(f"样本 {sample_id_for_debug}: 未知的当前模态 '{modality_to_process}'。")
+                return None
+            
+            if final_modal_data is None:
+                 logger.warning(f"样本 {sample_id_for_debug}: 未能为模态 '{modality_to_process}' 生成数据。将被跳过。")
+                 return None
+            
+            if final_modal_data.shape[-1] != self.base_channel:
+                logger.error(f"样本 {sample_id_for_debug}: 生成的模态 '{modality_to_process}' 通道数 ({final_modal_data.shape[-1]}) "
+                              f"不等于 base_channel ({self.base_channel})。将被跳过。")
+                return None
+
+            # 5. Padding 和 Mask 生成
+            # self.num_input_dim 在 __init__ 中对于单模态应该等于 self.base_channel
+            data_padded, mask_np = pad_sequence(
+                final_modal_data, 
+                self.target_seq_len, 
+                self.num_nodes, 
+                self.num_input_dim # 应该是3 
+            )
+
+            if data_padded.shape[0] != self.target_seq_len or \
+               data_padded.shape[1] != self.num_nodes or \
+               data_padded.shape[2] != self.num_input_dim:
+                logger.error(f"样本 {sample_id_for_debug}: Padding后的数据维度 ({data_padded.shape}) "
+                             f"与期望的 ({self.target_seq_len}, {self.num_nodes}, {self.num_input_dim}) 不符。将被跳过。")
+                return None
+
+            data_tensor = torch.from_numpy(data_padded).float()
+            label_tensor = torch.tensor(label_0based, dtype=torch.long)
+            mask_tensor = torch.from_numpy(mask_np).bool()
+
+            return data_tensor, label_tensor, mask_tensor, true_index
+
+        except Exception as e:
+            logger.error(f"在 __getitem__ 中处理样本 (ID: {sample_id_for_debug}, 索引 {true_index}) 时发生未捕获的异常: {e}", exc_info=True)
+            return None
+
+    def __len__(self):
+        return len(self.data_dict_raw) * self.repeat if self.data_dict_raw else 0
+
+    # --- 确保你的辅助方法在这里定义或可以被正确调用 ---
+    def _rand_view_transform(self, skeleton_data, agx_range, agy_range, s_range):
         agx = random.uniform(agx_range[0], agx_range[1])
         agy = random.uniform(agy_range[0], agy_range[1])
         s = random.uniform(s_range[0], s_range[1])
-
-        agx_rad = math.radians(agx)
-        agy_rad = math.radians(agy)
-        Rx = np.array([[1,0,0], [0,math.cos(agx_rad),math.sin(agx_rad)], [0,-math.sin(agx_rad),math.cos(agx_rad)]], dtype=skeleton_data.dtype)
-        Ry = np.array([[math.cos(agy_rad),0,-math.sin(agy_rad)], [0,1,0], [math.sin(agy_rad),0,math.cos(agy_rad)]], dtype=skeleton_data.dtype)
+        if skeleton_data.shape[-1] != 3: return skeleton_data 
+        agx_rad = np.radians(agx)
+        agy_rad = np.radians(agy)
+        Rx = np.array([[1,0,0], [0,np.cos(agx_rad),np.sin(agx_rad)], [0,-np.sin(agx_rad),np.cos(agx_rad)]], dtype=skeleton_data.dtype)
+        Ry = np.array([[np.cos(agy_rad),0,-np.sin(agy_rad)], [0,1,0], [np.sin(agy_rad),0,np.cos(agy_rad)]], dtype=skeleton_data.dtype)
         Ss = np.diag([s,s,s]).astype(skeleton_data.dtype)
-        
         original_shape = skeleton_data.shape
-        transformed_data = np.dot(skeleton_data.reshape(-1, self.base_channel), Ry @ Rx @ Ss)
+        transformed_data = np.dot(skeleton_data.reshape(-1, 3), Ry @ Rx @ Ss)
         return transformed_data.reshape(original_shape)
 
     def _apply_gaussian_noise(self, skeleton_data, level=0.01):
@@ -254,145 +401,119 @@ class Feeder(Dataset):
         return skeleton_data + noise
 
     def _temporal_sampling(self, data_numpy, target_len):
-        """
-        时间采样逻辑。
-        如果原始长度 <= 目标长度，则不进行采样，后续由 pad_sequence 填充。
-        如果原始长度 > 目标长度，则根据 self.random_choose_flag 进行采样。
-        """
         T_orig = data_numpy.shape[0]
         if T_orig == 0:
-            # 返回一个正确形状的全零数组，通道数应为 data_numpy 的实际通道数
             num_channels_local = data_numpy.shape[-1] if data_numpy.ndim == 3 and data_numpy.size > 0 else self.base_channel
             return np.zeros((target_len, self.num_nodes, num_channels_local), dtype=np.float32)
         
         if T_orig <= target_len:
-            # 不需要采样，后续由 pad_sequence 负责填充到 target_len
-            return data_numpy
-        else: # T_orig > target_len
-            if self.random_choose_for_sampling: # 使用 __init__ 中定义的属性
+            return data_numpy 
+        else: 
+            if self.random_choose_for_sampling:
                 indices = random.sample(range(T_orig), target_len)
                 indices.sort()
                 return data_numpy[indices, :, :]
-            else: # 验证/测试 或 训练时不随机选择
+            else: 
                 indices = np.linspace(0, T_orig - 1, target_len).round().astype(np.int_)
-                indices = np.clip(indices, 0, T_orig - 1) # 确保索引有效
+                indices = np.clip(indices, 0, T_orig - 1) 
                 return data_numpy[indices, :, :]
 
-    def __len__(self):
-        return len(self.data_dict_raw) * self.repeat if self.data_dict_raw else 0
+    def _joint_to_bone(self, data_numpy_tvc, bone_pairs_to_use, num_nodes_to_use):
+        """
+        将关节数据转换为骨骼数据，逻辑与 SkaTformer/TD-GCN 片段一致。
+        - 骨骼向量存储在骨骼对的第一个关节点上。
+        - 关节点2 (0-indexed, 即物理上的第3个关节点) 的特征被原始关节数据覆盖。
 
-    def __getitem__(self, index):
-        true_index = index % len(self.data_dict_raw)
+        Args:
+            data_numpy_tvc (np.ndarray): 输入的关节数据，形状 (T, num_nodes, 3)。
+                                         这应该是经过了增强和时间采样后的关节数据。
+            bone_pairs_to_use (list):  包含 (v1_1based, v2_1based) 元组的骨骼对列表。
+            num_nodes_to_use (int):    实际使用的节点数量。
+        Returns:
+            np.ndarray: 骨骼数据，形状 (T, num_nodes, 3)。
+        """
+        T, N, C_base = data_numpy_tvc.shape
+        if C_base != 3:
+            logger.error(f"_joint_to_bone 期望输入数据有3个通道，但得到 {C_base}。")
+            return np.zeros((T, N, C_base), dtype=data_numpy_tvc.dtype) 
+        if N != num_nodes_to_use:
+            logger.error(f"_joint_to_bone 期望输入数据有 {num_nodes_to_use} 个节点，但得到 {N}。")
+            return np.zeros_like(data_numpy_tvc)
+
+        data_bone = np.zeros_like(data_numpy_tvc)
+
+        if not bone_pairs_to_use:
+            logger.error("传入的 'bone_pairs_to_use' 为空。无法计算骨骼。")
+            return data_bone 
+
+        for v1_1based, v2_1based in bone_pairs_to_use: 
+            v1_0based, v2_0based = v1_1based - 1, v2_1based - 1
+            
+            if 0 <= v1_0based < num_nodes_to_use and 0 <= v2_0based < num_nodes_to_use:
+                data_bone[:, v1_0based, :] = data_numpy_tvc[:, v1_0based, :] - data_numpy_tvc[:, v2_0based, :]
+            else:
+                logger.warning(f"骨骼对 ({v1_1based}, {v2_1based}) 中的索引 ({v1_0based}, {v2_0based}) 超出范围 (0-{num_nodes_to_use-1})。")
+
+        # SkaTformer/TD-GCN 对关节点2 (0-indexed) 的特殊处理
+        if num_nodes_to_use > 2: # 确保索引2是有效的
+            data_bone[:, 2, :] = data_numpy_tvc[:, 2, :].copy()
         
-        # 首先检查标签是否有效，如果无效，则此样本不应被使用
-        label_0based = self.labels_0based[true_index]
-        sample_id_for_debug = self.data_dict_raw[true_index].get('file_name', f"unknown_idx_{true_index}")
+        return data_bone
 
-        if label_0based == -1: # 在 __init__ 中被标记为无效标签
-            logger.warning(f"样本 {sample_id_for_debug} (原始索引 {true_index}) 因其硬编码标签无效而被跳过。")
-            return None # 返回 None，让 collate_fn 过滤
+    def _joint_to_motion(self, data_numpy_tvc):
+        """
+        计算运动数据（帧间差分），逻辑与 SkaTformer/TD-GCN 片段一致。
+        最后一帧的运动通过复制倒数第二帧的运动来填充。
 
-        # 从内存中获取原始 joint 数据
-        joint_data_orig_from_mem = self.data_from_json[true_index]
+        Args:
+            data_numpy_tvc (np.ndarray): 输入数据（可以是关节或骨骼），形状 (T, num_nodes, C)。
+        
+        Returns:
+            np.ndarray: 运动数据，形状 (T, num_nodes, C)。
+        """
+        data_motion = np.zeros_like(data_numpy_tvc)
+        T = data_numpy_tvc.shape[0]
+        if T > 1:
+            data_motion[:T-1, :, :] = data_numpy_tvc[1:, :, :] - data_numpy_tvc[:-1, :, :]
+            data_motion[T-1, :, :] = data_motion[T-2, :, :].copy()
+        return data_motion
+    
+    def _perform_flipping(self, data_numpy): # 示例实现
+        flipped_data = data_numpy.copy()
+        flipped_data[:, :, 0] = -flipped_data[:, :, 0] # 假设 x 轴是左右
+        if hasattr(self, 'left_right_pairs'):
+            for left_node, right_node in self.left_right_pairs:
+                left_data_copy = flipped_data[:, left_node, :].copy()
+                flipped_data[:, left_node, :] = flipped_data[:, right_node, :].copy()
+                flipped_data[:, right_node, :] = left_data_copy
+        else:
+            logger.warning("_perform_flipping called but self.left_right_pairs is not defined.")
+        return flipped_data
 
-        if joint_data_orig_from_mem is None: # JSON数据加载失败或为空
-            logger.warning(f"样本 {sample_id_for_debug} (原始索引 {true_index}) 的骨骼数据为 None (可能JSON加载失败)。将被跳过。")
-            return None # 返回 None，让 collate_fn 过滤
-
-        # --- 从这里开始是正常的样本处理逻辑 ---
-        try:
-            current_joint_data = joint_data_orig_from_mem.copy()
-
-            # 1. 中心化
-            if self.center_joint_idx is not None and 0 <= self.center_joint_idx < self.num_nodes and current_joint_data.shape[0] > 0:
-                center_coord = current_joint_data[0, self.center_joint_idx, :].copy()
-                current_joint_data = current_joint_data - center_coord
-            
-            # 2. 数据增强 (仅训练时)
-            if self.train_val_flag == 'train':
-                apply_stronger_aug = self.augment_confused_classes and (label_0based in self.confused_classes_set)
-                if self.apply_rand_view_transform:
-                    rot_range = self.confused_rotation_range if apply_stronger_aug else (-60,60)
-                    scale_range = self.confused_scale_range if apply_stronger_aug else (0.5,1.5)
-                    current_joint_data = self._rand_view_transform(current_joint_data, agx_range=rot_range, agy_range=rot_range, s_range=scale_range)
-                if apply_stronger_aug and self.add_gaussian_noise and self.gaussian_noise_level > 0:
-                    current_joint_data = self._apply_gaussian_noise(current_joint_data, level=self.gaussian_noise_level)
-                
-                if self.apply_normalization: # 样本内 Min-Max 标准化
-                    temp_shape = current_joint_data.shape
-                    if temp_shape[0] > 0 :
-                        jd_flat = current_joint_data.reshape(-1, self.base_channel)
-                        min_v, max_v = np.min(jd_flat, axis=0, keepdims=True), np.max(jd_flat, axis=0, keepdims=True)
-                        range_v = max_v - min_v; range_v[range_v == 0] = 1e-6
-                        jd_flat_norm = (jd_flat - min_v) / range_v
-                        jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
-                        current_joint_data = jd_flat_scaled.reshape(temp_shape)
-            else: # 验证/测试集
-                if self.apply_normalization:
-                    temp_shape = current_joint_data.shape
-                    if temp_shape[0] > 0:
-                        jd_flat = current_joint_data.reshape(-1, self.base_channel)
-                        min_v, max_v = np.min(jd_flat, axis=0, keepdims=True), np.max(jd_flat, axis=0, keepdims=True)
-                        range_v = max_v - min_v; range_v[range_v == 0] = 1e-6
-                        jd_flat_norm = (jd_flat - min_v) / range_v
-                        jd_flat_scaled = jd_flat_norm * 2.0 - 1.0
-                        current_joint_data = jd_flat_scaled.reshape(temp_shape)
-
-            # 3. 时间采样
-            joint_data_sampled = self._temporal_sampling(current_joint_data, self.target_seq_len)
-            if joint_data_sampled is None or joint_data_sampled.shape[0] == 0 : # 再次检查采样结果
-                logger.warning(f"样本 {sample_id_for_debug} 时间采样后数据为空或长度为0。将被跳过。")
-                return None
-
-            # 4. 计算衍生模态和拼接
-            modal_data_list = []
-            # 确保 joint_data_sampled 是3D的并且有正确的 base_channel
-            if joint_data_sampled.ndim != 3 or joint_data_sampled.shape[-1] != self.base_channel:
-                 logger.error(f"样本 {sample_id_for_debug}: 用于衍生模态计算的 joint_data_sampled 维度 ({joint_data_sampled.shape}) 或通道数 ({joint_data_sampled.shape[-1] if joint_data_sampled.ndim==3 else 'N/A'}) 与期望的 (T, N, {self.base_channel}) 不符。将被跳过。")
-                 return None
-
-            data_bone_sampled = None
-            for modality in self.modalities:
-                if modality == 'joint':
-                    modal_data_list.append(joint_data_sampled.copy())
-                elif modality == 'bone':
-                    data_bone_sampled = joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
-                    modal_data_list.append(data_bone_sampled)
-                elif modality == 'joint_motion':
-                    modal_data_list.append(joint_to_motion(joint_data_sampled))
-                elif modality == 'bone_motion':
-                    if data_bone_sampled is None: # 确保骨骼数据已计算
-                         data_bone_sampled = joint_to_bone(joint_data_sampled, self.bone_pairs, self.num_nodes)
-                    modal_data_list.append(joint_to_motion(data_bone_sampled))
-            
-            if not modal_data_list:
-                 logger.warning(f"样本 {sample_id_for_debug}: 没有生成任何有效模态。将被跳过。")
-                 return None
-
-            data_concatenated = np.concatenate(modal_data_list, axis=-1)
-            
-            if data_concatenated.shape[-1] != self.num_input_dim:
-                logger.error(f"样本 {sample_id_for_debug}: 拼接后通道数 ({data_concatenated.shape[-1]}) 与预期的总输入维度 ({self.num_input_dim}) 不符。Modalities: {self.modalities}。将被跳过。")
-                return None
-
-            # 5. Padding 和 Mask
-            data_padded, mask_np = pad_sequence(data_concatenated, self.target_seq_len, self.num_nodes, self.num_input_dim)
-
-            data_tensor = torch.from_numpy(data_padded).float()
-            label_tensor = torch.tensor(label_0based, dtype=torch.long) # label_0based 此时一定是有效的
-            mask_tensor = torch.from_numpy(mask_np).bool()
-
-            # 可选：最终检查标签范围，理论上这里不应该再出问题
-            # if not (0 <= label_tensor.item() < self.num_classes):
-            #     logger.critical(f"!!!!!! 内部逻辑错误：即将返回无效标签 !!!!!! 样本 ID: {sample_id_for_debug}, 标签: {label_tensor.item()}")
-            #     return None
-
-            return data_tensor, label_tensor, mask_tensor, true_index
-
-        except Exception as e:
-            logger.error(f"在 __getitem__ 中处理样本 (ID: {sample_id_for_debug}, 索引 {true_index}) 时发生未捕获的异常: {e}", exc_info=True)
-            return None # 任何未预料的错误也返回 None
-
+    # 你可能还需要 _load_json_data_to_memory 方法，确保它填充 self.data_from_json
+    def _load_json_data_to_memory(self):
+        self.data_from_json = [] # 确保初始化
+        logger.info(f"Loading JSON data from: {self.root_dir} for {self.split} split...")
+        for item_info in tqdm(self.data_dict_raw, desc=f"Loading JSONs for {self.split}"):
+            file_name = item_info.get('file_name')
+            if not file_name:
+                self.data_from_json.append(None); continue
+            json_path = os.path.join(self.root_dir, file_name + '.json')
+            try:
+                with open(json_path, 'r') as f: json_file = json.load(f)
+                skeletons = json_file.get('skeletons') if isinstance(json_file, dict) else json_file
+                if skeletons and isinstance(skeletons, list) and len(skeletons) > 0:
+                    value = np.array(skeletons, dtype=np.float32)
+                    if value.ndim == 3 and value.shape[1] == self.num_nodes and value.shape[2] == self.base_channel:
+                        self.data_from_json.append(value)
+                    else:
+                        self.data_from_json.append(None); logger.warning(f"Data from {json_path} has incorrect shape.")
+                else:
+                     self.data_from_json.append(None); logger.warning(f"No valid skeleton data in {json_path}")
+            except Exception as e:
+                self.data_from_json.append(None); logger.error(f"Failed to load/parse {json_path}: {e}")
+        logger.info(f"Loaded {sum(1 for d in self.data_from_json if d is not None)} / {len(self.data_dict_raw)} JSON files successfully into self.data_from_json.")
+        
     def top_k(self, score, top_k_val): # 修改参数名以避免与实例变量冲突
         valid_labels_for_topk = [lbl for lbl in self.labels_0based if lbl != -1]
         # 确保 rank 是计算出来的
