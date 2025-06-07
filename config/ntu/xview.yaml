@@ -1,0 +1,146 @@
+# YAML 配置文件: config/ntu/xview_sdtgru_TA_GRU2.yaml (新文件名，反映模型和数据集)
+
+# --- 常规/项目设置 ---
+work_dir: ./work_dir/ntu60_xview_sdtgru_TA_GRU2 # 为新实验使用新目录
+seed: 1
+device: [0, 1]
+
+# --- 数据设置 ---
+feeder: feeders.feeder_ntu.Feeder_NTU # 保持NTU的Feeder
+modalities: ['joint', 'bone', 'joint_motion', 'bone_motion'] # 保持4模态
+base_channel: 3
+label_file: null # NTU的label通常在数据文件内
+
+train_feeder_args:
+  root_dir: 'data/ntu/'
+  data_path: 'NTU60_CV.npz' # 假设这是 cross-view 的数据文件
+  label_path: 'NTU60_CV.npz'
+  split: 'train'
+  debug: false
+  # 数据基本属性
+  num_classes: 60         # <<< NTU60 是60类
+  num_nodes: 25           # <<< NTU 是25个节点
+  max_len: 80             # <<< NTU 序列长度，可以根据数据调整，64或100或更长常见
+  window_size: 80         # 与max_len一致
+  base_channel: 3
+  # 训练特定参数
+  repeat: 1 # NTU数据量较大，通常不需要repeat
+  # 数据增强
+  random_choose: false    # NTU通常不做随机帧选择，而是完整序列或固定采样
+  random_rot: false       # NTU的Feeder可能有自己的旋转增强，这里先false
+  # 以下增强可以根据你的Feeder_NTU实现来决定是否保留或调整
+  apply_rand_view_transform: true # 如果你的Feeder_NTU支持，可以开启
+  rand_view_rotation_range: [-10, 10] # NTU视角变化大，数据增强角度可以小一些
+  rand_view_scale_range: [0.9, 1.1]
+  apply_random_flipping: true
+  # add_gaussian_noise: false # NTU数据量大，高斯噪声可能非必需，先关闭
+  normalization: true # 通常对骨骼数据有益
+
+test_feeder_args:
+  root_dir: 'data/ntu/'
+  data_path: 'NTU60_CV.npz'
+  label_path: 'NTU60_CV.npz'
+  split: 'test' # 或 'val'，取决于你的数据划分
+  debug: false
+  # 数据基本属性
+  num_classes: 60
+  num_nodes: 25
+  max_len: 80
+  window_size: 80
+  base_channel: 3
+  # 测试特定参数
+  repeat: 1
+  normalization: true
+  random_choose: false
+  random_rot: false
+  # apply_rand_view_transform: false # 测试时通常关闭
+  # add_gaussian_noise: false
+
+# --- 模型设置 ---
+model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier # 你的最新模型路径
+model_args:
+  # --- 基础配置 ---
+  num_nodes: 25             # <<< 更新为NTU的节点数
+  num_classes: 60           # <<< 更新为NTU的类别数
+  max_seq_len: 80           # <<< 与Feeder的max_len一致
+
+  # --- GRU/RNN 相关配置 ---
+  num_rnn_layers: 2          # 保持2层GRU
+  num_rnn_units: 256         # <<< 原配置是192，可以尝试256看看效果，NTU数据更复杂
+  rnn_dropout_rate: 0.20     # 对应2层RNN
+  zoneout_rate: 0.20         # 原配置是0.2
+
+  # --- TA-Inspired Module 配置 ---
+  use_ta_inspired_module: true
+  ta_inspired_mlp_hidden_ratio: 0.25
+
+  # -- 参数 for 局部注意力路径 (Local Path) --
+  sa_local_st_layers: 1       # 原 st_layers=2，这里拆分为局部和全局各1层作为起点
+  sa_local_n_heads: 8         # (256 % 8 == 0), d_k = 32. 可以尝试 8 或 16
+  sa_local_ffn_dim: 512       # (num_rnn_units * 2)
+  sa_local_dropout_rate: 0.1 # 原 st_dropout_rate=0.15
+  sa_local_qkv_bias: false    # 原 qkv_bias=false
+  sa_local_use_conv_proj: true # 原 use_conv_proj=true
+  sa_local_conv_kernel_size: 3 # 原 conv_kernel_size=5，局部路径可以小一些
+
+  # -- 参数 for 全局注意力路径 (Global Path) --
+  sa_global_st_layers: 1      # 原 st_layers=2
+  sa_global_n_heads: 8        # 原 n_heads=8 (256 % 8 == 0), d_k = 32
+  sa_global_ffn_dim: 512      # 原 ffn_dim=384，现在 num_rnn_units=256，对应512 (2倍)
+  sa_global_dropout_rate: 0.2 # 原 st_dropout_rate=0.15
+  sa_global_qkv_bias: false   # 原 qkv_bias=false
+  sa_global_use_conv_proj: true # 原 use_conv_proj=true
+  sa_global_conv_kernel_size: 7 # 原 conv_kernel_size=5
+  sa_global_use_global_spatial_bias: true # 原 use_global_spatial_bias=true
+
+  # -- 局部注意力邻接矩阵相关 --
+  local_adj_k_hop: 1
+
+  # -- 融合策略与参数 --
+  spatial_fusion_type: 'dynamic_gate'
+  spatial_fusion_gate_hidden_dim: 64 # (num_rnn_units / 4)
+
+  # --- 时间注意力 (Temporal Attention after GRUs and TA-Inspired) 配置 ---
+  use_temporal_attn: true         # 原 use_temporal_attn=true
+  num_temporal_layers: 1          # 原 num_temporal_layers=1
+  temporal_n_heads: 16            # 原 temporal_n_heads=12。256%16==0
+  temporal_ffn_dim: 1024          # 原 temporal_ffn_dim=768。num_rnn_units*4 = 1024
+  temporal_dropout_rate: 0.20     # 原 temporal_dropout_rate=0.2
+
+  # --- 分类头与输出配置 ---
+  classifier_hidden_dim: 128      # <<< 原 classifier_hidden_dim=64，可以尝试增大
+  classifier_dropout: 0.4         # 原 classifier_dropout=0.4
+  use_gap: true
+  output_attention: false
+
+# --- 训练策略 ---
+optimizer: AdamW
+base_lr: 0.001
+weight_decay: 0.0005
+warmup_lr: 1.0e-6
+
+lr_scheduler: multistep
+warm_up_epoch: 15
+step: [30, 50] # NTU训练轮数可能需要更多，衰减点可能需要后移
+lr_decay_rate: 0.1
+
+loss_type: SmoothCE
+
+num_epoch: 65       # <<< NTU通常需要更多epochs，例如80-120，配合early_stop
+start_epoch: 0
+batch_size: 256     # <<< 原配置256，如果显存允许可以保持，否则128或64
+test_batch_size: 256 # <<< 对应调整
+num_worker: 16      # <<< 原配置24，根据你的机器调整
+
+grad_clip: true
+grad_max: 20.0
+early_stop_patience: 20 # 原配置20，是合理的
+
+# --- 日志与保存 ---
+log_interval: 100
+eval_interval: 1
+save_interval: 0
+save_epoch: 0
+print_log: true
+save_score: true
+show_topk: [1, 5]

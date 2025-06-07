@@ -1,7 +1,7 @@
+# 文件名: processor/processor.py (修改版 - 适应后期融合的分数保存)
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# DataLoader 和 DataParallel 在需要时导入
 from tensorboardX import SummaryWriter
 import numpy as np
 import yaml
@@ -50,6 +50,7 @@ try:
 except ImportError:
     CosineLRScheduler = None
 
+# --- 你自定义的 FocalSmoothCrossEntropy 损失函数 ---
 class FocalSmoothCrossEntropy(nn.Module):
     def __init__(self, num_classes, smoothing=0.1, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalSmoothCrossEntropy, self).__init__()
@@ -114,30 +115,22 @@ class Processor():
         self.arg = arg
         self.best_acc = 0.0
         self.best_acc_epoch = 0
-        self.best_state_dict = None # 用于保存最佳模型的状态字典（CPU上）
         self.global_step = 0
 
-        self._setup_device_and_logging()
+        self._setup_device_and_logging() # 包含保存配置
         self.print_log("Processor 初始化开始...")
-        self._save_config()
         self._load_and_prepare_data()
         self._load_and_prepare_model() # loss 在这里初始化
 
-        self.n_iter_per_epoch = 0
         if self.arg.phase == 'train':
-            if 'train' in self.data_loader and self.data_loader['train'] is not None:
-                try:
-                    self.n_iter_per_epoch = len(self.data_loader['train'])
-                    if self.n_iter_per_epoch == 0: self.print_log("训练数据加载器长度为 0。", logging.WARNING)
-                except Exception as e:
-                    self.print_log(f"警告: 获取训练迭代次数失败: {e}", logging.WARNING)
+            self.n_iter_per_epoch = len(self.data_loader['train']) if 'train' in self.data_loader and self.data_loader['train'] else 0
+            if self.n_iter_per_epoch == 0: self.print_log("警告: 训练数据加载器为空或长度为0。", logging.WARNING)
             self.global_step = getattr(self.arg, 'start_epoch', 0) * self.n_iter_per_epoch
-            self._load_optimizer_and_scheduler()
-        else:
-            if not hasattr(self, 'optimizer') or self.optimizer is None:
-                 self._load_optimizer_and_scheduler(load_scheduler=False)
+            self._load_optimizer() # 简化后的优化器加载
+        else: # 测试或评估阶段，也需要优化器实例（即使不进行step）
+            self._load_optimizer()
 
-        self.lr = self.optimizer.param_groups[0]['lr'] if hasattr(self, 'optimizer') and self.optimizer and self.optimizer.param_groups else self.arg.base_lr
+        self.lr = self.arg.base_lr # 初始化lr，将在每个epoch更新
         self.print_log("Processor 初始化完成。")
 
     def _setup_device_and_logging(self):
@@ -280,18 +273,15 @@ class Processor():
     def _load_and_prepare_model(self):
         from torch.nn.parallel import DataParallel
         self.print_log(f"模型将运行在设备: {self.output_device}")
-        try:
-            if not self.arg.model: raise ValueError("'model' 参数未设置。")
-            Model = import_class(self.arg.model)
-            try: 
-                model_file_path = inspect.getfile(Model)
-                if os.path.exists(model_file_path) and os.path.isfile(model_file_path): shutil.copy2(model_file_path, self.arg.work_dir)
-            except Exception: pass
-            if not self.arg.model_args: raise ValueError("'model_args' 参数未设置或为空。")
-            # 对于单流，model_args['num_input_dim'] 应该已经是3 (由main.py设置)
-            self.model = Model(model_cfg=self.arg.model_args) 
-            self.print_log(f"模型 '{self.arg.model}' 实例化成功。")
-        except Exception as e: self.print_log(f"错误: 模型加载/实例化失败: {e}", logging.CRITICAL); traceback.print_exc(); raise
+        if not self.arg.model: raise ValueError("'model' 参数未设置。")
+        Model = import_class(self.arg.model)
+        try: 
+            model_file_path = inspect.getfile(Model)
+            if os.path.exists(model_file_path) and os.path.isfile(model_file_path): shutil.copy2(model_file_path, self.arg.work_dir)
+        except Exception: pass
+        if not self.arg.model_args: raise ValueError("'model_args' 参数未设置或为空。")
+        # 对于单流，model_args['num_input_dim'] 应该已经是3 (由main.py设置)
+        self.model = Model(model_cfg=self.arg.model_args) 
         
         loss_type = getattr(self.arg, 'loss_type', 'CE').upper()
         if loss_type == 'SMOOTHCE':
@@ -334,214 +324,181 @@ class Processor():
             self.model = DataParallel(self.model, device_ids=self.arg.device_actual, output_device=self.output_device)
             self.print_log(f'模型已在 GPUs {self.arg.device_actual} 上启用 DataParallel。')
 
-    # _load_optimizer_and_scheduler, _adjust_learning_rate_for_warmup, record_time, split_time 保持不变
-    def _load_optimizer_and_scheduler(self, load_scheduler=True):
-        optimizer_type = (getattr(self.arg, 'optimizer', None) or 'AdamW').lower()
-        lr = getattr(self.arg, 'base_lr', None) or 0.001
-        wd = getattr(self.arg, 'weight_decay', 0.01) if getattr(self.arg, 'weight_decay', None) is not None else 0.01
+    def _load_optimizer(self):
+        """加载优化器 (仅支持 SGD 和 AdamW)。"""
+        optimizer_type = self.arg.optimizer.lower() # 假设 optimizer 参数总是在 arg 中
+        lr = self.arg.base_lr
+        wd = self.arg.weight_decay
+        
+        # TD-GCN 直接获取所有参数，不区分是否 requires_grad，这在多数情况下没问题
         params_to_optimize = [p for p in self.model.parameters() if p.requires_grad]
-
         if not params_to_optimize:
-            self.print_log("警告: 模型中没有可优化的参数。", logging.WARNING)
-            self.optimizer = optim.AdamW([], lr=lr) 
-            self.scheduler = None 
-            self.lr_scheduler_each_step = None
+            self.print_log("警告: 模型中没有可训练的参数。", logging.WARNING)
+            # 创建一个无参数的优化器以避免后续代码出错
+            self.optimizer = optim.AdamW([], lr=lr, weight_decay=wd)
             return
-
         if optimizer_type == 'sgd':
             self.optimizer = optim.SGD(
-                params_to_optimize, lr=lr, momentum=getattr(self.arg, 'momentum', 0.9),
-                nesterov=getattr(self.arg, 'nesterov', False), weight_decay=wd)
-        elif optimizer_type == 'adam':
-            self.optimizer = optim.Adam(params_to_optimize, lr=lr, weight_decay=wd)
+                params_to_optimize,
+                lr=lr,
+                momentum=self.arg.momentum, # 假设 momentum 总是在 arg 中
+                nesterov=self.arg.nesterov, # 假设 nesterov 总是在 arg 中
+                weight_decay=wd)
         elif optimizer_type == 'adamw':
-            self.optimizer = optim.AdamW(params_to_optimize, lr=lr, weight_decay=wd)
+            self.optimizer = optim.AdamW(
+                params_to_optimize,
+                lr=lr,
+                weight_decay=wd)
         else:
+            self.print_log(f"错误: 不支持的优化器 '{optimizer_type}'. 请使用 'sgd' 或 'adamw'.", logging.CRITICAL)
             raise ValueError(f"不支持的优化器类型: {optimizer_type}")
+        
         self.print_log(f"优化器: {optimizer_type.upper()} (初始lr={lr:.2e}, wd={wd:.1e})")
-
+        # 由于是手动管理学习率，不再需要 PyTorch 的 scheduler
         self.scheduler = None
         self.lr_scheduler_each_step = None
-        if not load_scheduler: return
 
-        scheduler_type = getattr(self.arg, 'lr_scheduler', 'multistep').lower()
-        warmup_epochs = getattr(self.arg, 'warm_up_epoch', 0)
-        
-        if not self.optimizer: self.print_log("错误: 优化器未在加载调度器之前初始化。", logging.ERROR); return
-        self.print_log(f"尝试加载调度器: {scheduler_type}")
-
-        if scheduler_type == 'multistep':
-            cfg_steps = getattr(self.arg, 'step', [])
-            if not cfg_steps or not isinstance(cfg_steps, list):
-                self.print_log("警告: MultiStepLR 'step' 参数为空或格式不正确。", logging.WARNING)
-                self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[int(1e9)], gamma=1.0)
-            else:
-                adjusted_milestones = [s - warmup_epochs for s in cfg_steps if s > warmup_epochs]
-                if not adjusted_milestones and cfg_steps:
-                    self.print_log(f"警告: MultiStepLR 的所有衰减点 ({cfg_steps}) 都在预热期 ({warmup_epochs} epochs) 内。", logging.WARNING)
-                    self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[int(1e9)], gamma=1.0)
-                elif adjusted_milestones:
-                    self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=adjusted_milestones, gamma=getattr(self.arg, 'lr_decay_rate', 0.1))
-                else: 
-                    self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[], gamma=getattr(self.arg, 'lr_decay_rate', 0.1))
-            if self.scheduler:
-                actual_milestones_for_log = self.scheduler.milestones if hasattr(self.scheduler, 'milestones') and isinstance(self.scheduler.milestones, list) else '未知'
-                if isinstance(actual_milestones_for_log, list) and len(actual_milestones_for_log) == 1 and actual_milestones_for_log[0] == int(1e9): actual_milestones_for_log = '无计划衰减(milestones过大)'
-                elif isinstance(actual_milestones_for_log, list) and not actual_milestones_for_log : actual_milestones_for_log = '无有效衰减点(在warmup后)'
-                self.print_log(f"调度器: MultiStepLR (用户配置step={cfg_steps}, warmup={warmup_epochs} => 调度器实际milestones={actual_milestones_for_log}, gamma={getattr(self.arg, 'lr_decay_rate', 0.1)})")
-            if warmup_epochs > 0 and scheduler_type == 'multistep': self.print_log(f'MultiStepLR 将配合手动学习率预热, epochs: {warmup_epochs}')
-        
-        elif scheduler_type == 'cosine':
-            if CosineLRScheduler is None: self.print_log("错误: CosineLRScheduler (timm) 未导入。", logging.ERROR); return
-            if self.n_iter_per_epoch <= 0 and self.arg.phase == 'train': self.print_log("错误: CosineLRScheduler 需要 n_iter_per_epoch > 0。", logging.ERROR); return
-            total_iterations = int(self.arg.num_epoch * self.n_iter_per_epoch)
-            warmup_iterations = int(warmup_epochs * self.n_iter_per_epoch)
-            try:
-                self.lr_scheduler_each_step = CosineLRScheduler(
-                    self.optimizer, t_initial=(total_iterations - warmup_iterations) if getattr(self.arg, 'warmup_prefix', True) else total_iterations,
-                    lr_min=getattr(self.arg, 'min_lr', 1e-6), warmup_lr_init=getattr(self.arg, 'warmup_lr', 1e-6),
-                    warmup_t=warmup_iterations, cycle_limit=1, t_in_epochs=False, warmup_prefix=getattr(self.arg, 'warmup_prefix', True))
-                self.print_log("调度器: CosineLRScheduler (timm) 加载成功。")
-            except Exception as e: self.print_log(f"错误: 初始化 CosineLRScheduler 失败: {e}", logging.ERROR)
-        else: self.print_log(f"警告: 不支持的学习率调度器类型 '{scheduler_type}'。", logging.WARNING)
-
-    def _adjust_learning_rate_for_warmup(self, epoch):
-        if self.lr_scheduler_each_step is not None: return self.optimizer.param_groups[0]['lr']
-        warmup_epochs = getattr(self.arg, 'warm_up_epoch', 0)
+    def _adjust_learning_rate_for_warmup(self, epoch): # 保持原名，实现手动warmup和decay
+        """手动调整学习率，包括预热和基于step的衰减。在每个训练epoch开始时调用。"""
         base_lr = self.arg.base_lr
-        current_lr = self.optimizer.param_groups[0]['lr']
+        warmup_epochs = getattr(self.arg, 'warm_up_epoch', 0)
+        calculated_lr = base_lr
+
         if epoch < warmup_epochs:
             warmup_lr_init = getattr(self.arg, 'warmup_lr', 1e-6)
-            lr = warmup_lr_init + (base_lr - warmup_lr_init) * (epoch + 1) / warmup_epochs
-            for param_group in self.optimizer.param_groups: param_group['lr'] = lr
-            current_lr = lr
-        elif epoch == warmup_epochs and warmup_epochs > 0: 
-            for param_group in self.optimizer.param_groups: param_group['lr'] = base_lr
-            current_lr = base_lr
-        return current_lr
+            if warmup_epochs > 0: # 避免除以零
+                calculated_lr = warmup_lr_init + (base_lr - warmup_lr_init) * (epoch + 1) / warmup_epochs
+        else:
+            # MultiStep 衰减逻辑
+            decay_steps = getattr(self.arg, 'step', [])
+            num_decays = np.sum(epoch >= np.array(decay_steps)) # 假设step是0-based epoch索引
+            calculated_lr = base_lr * (getattr(self.arg, 'lr_decay_rate', 0.1) ** num_decays)
+
+        # 应用计算出的学习率
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = calculated_lr
+        
+        self.lr = calculated_lr # 更新 self.lr 属性
+        return calculated_lr
 
     def record_time(self): self.cur_time = time.time()
     def split_time(self): split = time.time() - self.cur_time; self.record_time(); return split
 
     def train(self, epoch, save_model=False):
-            self.model.train()
-            current_lr_for_display = self._adjust_learning_rate_for_warmup(epoch)
-            self.print_log(f'======> 训练 Epoch: {epoch + 1}')
-            if self.lr_scheduler_each_step is None:
-                if epoch < getattr(self.arg, 'warm_up_epoch', 0): self.print_log(f"Epoch {epoch+1} 开始 (Warmup)，学习率: {current_lr_for_display:.8f}")
-                else: self.print_log(f"Epoch {epoch+1} 开始，学习率: {current_lr_for_display:.8f}")
+        self.model.train()
+        # 在epoch开始时调用手动的学习率调整函数
+        current_lr_for_display = self._adjust_learning_rate_for_warmup(epoch) # <<< 调用修改后的函数
 
-            loader = self.data_loader['train']
-            if not loader: self.print_log("错误: 训练数据加载器为空！", logging.ERROR); return
+        # 日志打印调整，避免重复打印warmup信息
+        if epoch < getattr(self.arg, 'warm_up_epoch', 0) :
+             self.print_log(f'======> 训练 Epoch: {epoch + 1} (Warmup)，当前学习率: {current_lr_for_display:.8f}')
+        else:
+             self.print_log(f'======> 训练 Epoch: {epoch + 1}，当前学习率: {current_lr_for_display:.8f}')
 
-            loss_values, acc_values, grad_norm_values = [], [], []
-            if self.train_writer: self.train_writer.add_scalar('meta/epoch', epoch + 1, epoch + 1)
+
+        loader = self.data_loader['train']
+        if not loader: self.print_log("错误: 训练数据加载器为空！", logging.ERROR); return
+
+        loss_values, acc_values, grad_norm_values = [], [], []
+        if self.train_writer: self.train_writer.add_scalar('meta/epoch', epoch + 1, epoch + 1) # 使用 epoch + 1
+        
+        self.record_time(); timer = {'dataloader': 0.0, 'model': 0.0, 'statistics': 0.0}
+        if self.n_iter_per_epoch == 0 and loader: 
+            try: self.n_iter_per_epoch = len(loader)
+            except: pass # 避免在某些iterable上失败
+
+        process = tqdm(loader, desc=f"Epoch {epoch+1}/{self.arg.num_epoch}", ncols=120, leave=False) 
+        log_interval = getattr(self.arg, 'log_interval', 50)
+        if self.n_iter_per_epoch > 0 and log_interval > self.n_iter_per_epoch : # 确保至少在epoch末尾打印一次
+            log_interval = self.n_iter_per_epoch
+
+
+        for batch_idx, batch_data in enumerate(process):
+            self.global_step += 1
+            # 移除了 self.lr_scheduler_each_step.step() 因为我们不再使用它
             
-            self.record_time(); timer = {'dataloader': 0.0, 'model': 0.0, 'statistics': 0.0}
-            if self.n_iter_per_epoch == 0 and loader: 
-                try: self.n_iter_per_epoch = len(loader)
-                except: pass
-
-            process = tqdm(loader, desc=f"Epoch {epoch+1}/{self.arg.num_epoch}", ncols=120, leave=False) 
-            log_interval = getattr(self.arg, 'log_interval', 50)
-
-            for batch_idx, batch_data in enumerate(process):
-                self.global_step += 1
-                if self.lr_scheduler_each_step: self.lr_scheduler_each_step.step(self.global_step) 
-                
-                if batch_data is None: timer['dataloader'] += self.split_time(); continue
-                try: 
-                    if len(batch_data) == 4:
-                        data, label, mask_from_batch, index = batch_data 
-                    elif len(batch_data) == 3: # 兼容不返回 mask 的 feeder (如SkaTformer原始版)
-                        data, label, index = batch_data
-                        mask_from_batch = None
-                    else:
-                        raise ValueError(f"批次数据元素数量不为3或4: {len(batch_data)}")
-                except Exception as e_unpack: 
-                    self.print_log(f"警告: Batch {batch_idx} 数据解包失败: {e_unpack}", logging.WARNING)
-                    timer['dataloader'] += self.split_time(); continue
-                
-                timer['dataloader'] += self.split_time()
-                
-                data = data.float().to(self.output_device,non_blocking=True)
-                label = label.long().to(self.output_device,non_blocking=True)
-                mask_to_model = None
-                if mask_from_batch is not None: 
-                    mask_to_model = mask_from_batch.bool().to(self.output_device,non_blocking=True)
-                
-                self.record_time()
-                try:
-                    output, _ = self.model(data, mask=mask_to_model) # 传递 mask_to_model
-                    loss = self.loss(output, label)
-                    if torch.isnan(loss) or torch.isinf(loss): 
-                        self.print_log(f"警告: Batch {batch_idx} 损失 NaN/Inf！跳过此批次。", logging.WARNING)
-                        timer['model'] += self.split_time(); continue
-                    
-                    self.optimizer.zero_grad(); loss.backward()
-                    total_norm = 0.0; valid_grad = True
-                    for p in self.model.parameters():
-                        if p.grad is not None:
-                            if not torch.isfinite(p.grad).all(): valid_grad = False; break
-                            total_norm += p.grad.data.norm(2).item() ** 2
-                    total_norm = total_norm ** 0.5 if valid_grad else float('nan')
-                    
-                    if valid_grad:
-                        if not np.isnan(total_norm): grad_norm_values.append(total_norm)
-                        if getattr(self.arg, 'grad_clip', True) and getattr(self.arg, 'grad_max', 1.0) > 0: 
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.arg.grad_max)
-                        self.optimizer.step()
-                    else: 
-                        self.print_log(f"警告: Batch {batch_idx} 梯度 NaN/Inf，跳过优化步骤。", logging.WARNING)
-                        self.optimizer.zero_grad()
-                except Exception as e_train_step: 
-                    self.print_log(f"错误: 训练步骤 (Batch {batch_idx}) 失败: {e_train_step}", logging.ERROR)
+            # ... (数据加载和前向、反向传播逻辑保持你之前的版本) ...
+            if batch_data is None: timer['dataloader'] += self.split_time(); continue
+            try: 
+                if len(batch_data) == 4: data, label, mask_from_batch, index = batch_data 
+                elif len(batch_data) == 3: data, label, index = batch_data; mask_from_batch = None
+                else: raise ValueError(f"批次数据元素数量不为3或4: {len(batch_data)}")
+            except Exception as e_unpack: 
+                self.print_log(f"警告: Batch {batch_idx} 数据解包失败: {e_unpack}", logging.WARNING)
+                timer['dataloader'] += self.split_time(); continue
+            timer['dataloader'] += self.split_time()
+            data = data.float().to(self.output_device,non_blocking=True)
+            label = label.long().to(self.output_device,non_blocking=True)
+            mask_to_model = mask_from_batch.bool().to(self.output_device,non_blocking=True) if mask_from_batch is not None else None
+            self.record_time()
+            try:
+                output, _ = self.model(data, mask=mask_to_model)
+                loss = self.loss(output, label)
+                if torch.isnan(loss) or torch.isinf(loss): 
+                    self.print_log(f"警告: Batch {batch_idx} 损失 NaN/Inf！跳过此批次。", logging.WARNING)
                     timer['model'] += self.split_time(); continue
-                
-                timer['model'] += self.split_time()
-                loss_item = loss.item(); loss_values.append(loss_item)
-                with torch.no_grad(): 
-                    _, pred = torch.max(output.data, 1)
-                    acc_item = torch.mean((pred == label.data).float()).item()
-                    acc_values.append(acc_item)
-                
-                grad_postfix_str = f"{total_norm:.2f}" if not np.isnan(total_norm) else "NaN"
-                process.set_postfix_str(f"Loss: {loss_item:.3f}, Acc: {acc_item:.2f}, Grad: {grad_postfix_str}")
+                self.optimizer.zero_grad(); loss.backward()
+                total_norm = 0.0; valid_grad = True
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        if not torch.isfinite(p.grad).all(): valid_grad = False; break
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                total_norm = total_norm ** 0.5 if valid_grad else float('nan')
+                if valid_grad:
+                    if not np.isnan(total_norm): grad_norm_values.append(total_norm)
+                    if getattr(self.arg, 'grad_clip', True) and getattr(self.arg, 'grad_max', 1.0) > 0: 
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.arg.grad_max)
+                    self.optimizer.step()
+                else: 
+                    self.print_log(f"警告: Batch {batch_idx} 梯度 NaN/Inf，跳过优化步骤。", logging.WARNING)
+                    self.optimizer.zero_grad()
+            except Exception as e_train_step: 
+                self.print_log(f"错误: 训练步骤 (Batch {batch_idx}) 失败: {e_train_step}", logging.ERROR); traceback.print_exc()
+                timer['model'] += self.split_time(); continue
+            timer['model'] += self.split_time()
+            loss_item = loss.item(); loss_values.append(loss_item)
+            with torch.no_grad(): 
+                _, pred = torch.max(output.data, 1)
+                acc_item = torch.mean((pred == label.data).float()).item()
+                acc_values.append(acc_item)
+            grad_postfix_str = f"{total_norm:.2f}" if not np.isnan(total_norm) else "NaN"
+            process.set_postfix_str(f"Loss: {loss_item:.3f}, Acc: {acc_item:.2f}, Grad: {grad_postfix_str}")
+            self.record_time()
+            if log_interval > 0 and ((batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == self.n_iter_per_epoch):
+                lr_curr_for_log = self.optimizer.param_groups[0]['lr'] 
+                grad_norm_batch_str = f"{total_norm:.4f}" if not np.isnan(total_norm) else "NaN"                
+                log_line = (f"Epoch: [{epoch+1}][{batch_idx+1}/{self.n_iter_per_epoch}]\t"
+                            f"Loss: {loss_item:.4f}\tAcc: {acc_item:.3f}\tLR: {lr_curr_for_log:.8f}\tGradNorm: {grad_norm_batch_str}")
+                # self.print_log(log_line, print_time=False) # tqdm 已经打印时间了
+                if self.train_writer: 
+                    self.train_writer.add_scalar('批次训练/损失', loss_item, self.global_step)
+                    self.train_writer.add_scalar('批次训练/准确率', acc_item, self.global_step)
+                    if not np.isnan(total_norm): self.train_writer.add_scalar('批次训练/梯度范数', total_norm, self.global_step)
+                    self.train_writer.add_scalar('学习率/迭代', lr_curr_for_log, self.global_step)
+            timer['statistics'] += self.split_time()
+        
+        process.close()
+        avg_loss = np.nanmean(loss_values) if loss_values else float('nan')
+        avg_acc = np.nanmean(acc_values) * 100 if acc_values else 0.0
+        avg_grad_epoch_val = np.nanmean(grad_norm_values) if grad_norm_values else float('nan')
+        avg_grad_epoch_str = f"{avg_grad_epoch_val:.4f}" if not np.isnan(avg_grad_epoch_val) else "NaN"
+        total_time_epoch = sum(timer.values())
+        prop = {k:f"{int(round(v*100/total_time_epoch))}%" if total_time_epoch>0 else "0%" for k,v in timer.items()}
+        self.print_log(f'\t平均训练损失: {avg_loss:.4f}. 平均训练准确率: {avg_acc:.2f}%. 平均梯度范数: {avg_grad_epoch_str}')
+        self.print_log(f'\t时间消耗: [数据加载]{prop["dataloader"]}, [网络计算]{prop["model"]}, [统计]{prop["statistics"]}')
+        if self.train_writer:
+            if not np.isnan(avg_loss): self.train_writer.add_scalar('Epoch训练/平均损失', avg_loss, epoch + 1)
+            if not np.isnan(avg_acc): self.train_writer.add_scalar('Epoch训练/平均准确率', avg_acc / 100.0, epoch + 1)
+            if not np.isnan(avg_grad_epoch_val): self.train_writer.add_scalar('Epoch训练/平均梯度范数', avg_grad_epoch_val, epoch + 1)
+            self.train_writer.add_scalar('学习率/Epoch', self.optimizer.param_groups[0]['lr'], epoch + 1)
 
-                self.record_time()
-                if log_interval > 0 and ((batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == self.n_iter_per_epoch):
-                    lr_curr_for_log = self.optimizer.param_groups[0]['lr'] 
-                    grad_norm_batch_str = f"{total_norm:.4f}" if not np.isnan(total_norm) else "NaN"                
-                    log_line = (f"Epoch: [{epoch+1}][{batch_idx+1}/{self.n_iter_per_epoch}]\t"
-                                f"Loss: {loss_item:.4f}\tAcc: {acc_item:.3f}\tLR: {lr_curr_for_log:.8f}\tGradNorm: {grad_norm_batch_str}")
-                    if getattr(self.arg, 'print_log', True): print(log_line)
-                    self.logger.info(log_line)
-                    if self.train_writer: 
-                        self.train_writer.add_scalar('批次训练/损失', loss_item, self.global_step)
-                        self.train_writer.add_scalar('批次训练/准确率', acc_item, self.global_step)
-                        if not np.isnan(total_norm): self.train_writer.add_scalar('批次训练/梯度范数', total_norm, self.global_step)
-                        self.train_writer.add_scalar('学习率/迭代', lr_curr_for_log, self.global_step)
-                timer['statistics'] += self.split_time()
-            
-            process.close()
-            avg_loss = np.nanmean(loss_values) if loss_values else float('nan')
-            avg_acc = np.nanmean(acc_values) * 100 if acc_values else 0.0
-            avg_grad_epoch_val = np.nanmean(grad_norm_values) if grad_norm_values else float('nan')
-            avg_grad_epoch_str = f"{avg_grad_epoch_val:.4f}" if not np.isnan(avg_grad_epoch_val) else "NaN"
-            total_time_epoch = sum(timer.values())
-            prop = {k:f"{int(round(v*100/total_time_epoch))}%" if total_time_epoch>0 else "0%" for k,v in timer.items()}
-            self.print_log(f'\t平均训练损失: {avg_loss:.4f}. 平均训练准确率: {avg_acc:.2f}%. 平均梯度范数: {avg_grad_epoch_str}')
-            self.print_log(f'\t时间消耗: [数据加载]{prop["dataloader"]}, [网络计算]{prop["model"]}, [统计]{prop["statistics"]}')
-            if self.train_writer:
-                if not np.isnan(avg_loss): self.train_writer.add_scalar('Epoch训练/平均损失', avg_loss, epoch + 1)
-                if not np.isnan(avg_acc): self.train_writer.add_scalar('Epoch训练/平均准确率', avg_acc / 100.0, epoch + 1)
-                if not np.isnan(avg_grad_epoch_val): self.train_writer.add_scalar('Epoch训练/平均梯度范数', avg_grad_epoch_val, epoch + 1)
-                self.train_writer.add_scalar('学习率/Epoch', self.optimizer.param_groups[0]['lr'], epoch + 1)
-
-            if self.scheduler and self.lr_scheduler_each_step is None: 
-                if epoch >= getattr(self.arg, 'warm_up_epoch', 0):
-                    self.scheduler.step()
-                    self.print_log(f"\tMultiStepLR.step() 已执行。新学习率: {self.optimizer.param_groups[0]['lr']:.8f}")
+        # 移除了 self.scheduler.step() 的调用，因为现在是手动调整
+        # 如果需要打印学习率衰减的日志，可以在 _adjust_learning_rate_for_warmup 中当衰减发生时打印
+        if epoch >= getattr(self.arg, 'warm_up_epoch', 0):
+            # 检查是否在衰减点
+            decay_steps = getattr(self.arg, 'step', [])
+            if epoch +1 in decay_steps : # epoch是0-based, step中的通常是1-based epoch num
+                 self.print_log(f"\t学习率在 Epoch {epoch+1} 后可能已衰减。新学习率: {self.optimizer.param_groups[0]['lr']:.8f}")
 
     def eval(self, epoch, save_score_final_eval=False, loader_name=['val'], wrong_file=None, result_file=None):
         self.model.eval()
@@ -614,13 +571,18 @@ class Processor():
                             if self.arg.phase == 'train' and self.val_writer: self.val_writer.add_scalar(f'评估/{ln}_epoch_acc_top{k_val}', top_k_acc_val, epoch + 1)
                         except Exception as e_topk: self.print_log(f"警告: 计算 Top-{k_val} 准确率失败 (数据集: {ln}): {e_topk}", logging.WARNING)
             
+            # --- 修改保存分数的文件名和逻辑 ---
             # save_score_final_eval 通常在 Processor.start() 的最终测试阶段设为 True
             # ln 通常是 'test' (如果 test_loader 存在) 或 'val' (如果用 val_loader 做最终评估)
             if save_score_final_eval and ln in ['test', 'val'] and len(indices_all_np) == len(logits_all_np):
                 # 固定文件名为 'epoch1_test_score.pkl' 以便 ensemble.py 查找
+                # 注意： "epoch1" 这个名字是 Hyperformer ensemble.py 的硬编码，可能不代表实际epoch
+                # 如果你的 ensemble.py 被修改为接受其他文件名，这里可以相应调整
                 score_file_name = 'epoch1_test_score.pkl' 
-                current_score_path = os.path.join(self.arg.work_dir, score_file_name)                
+                current_score_path = os.path.join(self.arg.work_dir, score_file_name)
+                
                 # 保存的格式是 {'indices': ..., 'scores': ..., 'labels': ...}
+                # 确保你的 ensemble.py 能够读取这个格式中的 'scores' 和 'labels'
                 score_data_to_save = {
                     'indices': indices_all_np,
                     'scores': logits_all_np, 
@@ -635,7 +597,8 @@ class Processor():
                 except Exception as e_save_score: 
                     self.print_log(f"警告: 保存评估分数 ({ln}) 失败: {e_save_score}", logging.WARNING)
                     if ln_idx == 0: final_score_path_for_return = None
-
+            # --- 结束修改 ---
+            
             if (wrong_file or result_file) and ln_idx == 0 and len(indices_all_np) == len(labels_all_np): 
                 self._save_prediction_details(indices_all_np, preds_all_np, labels_all_np, wrong_file, result_file)
             
@@ -654,6 +617,7 @@ class Processor():
         return final_eval_acc, final_score_path_for_return # 返回路径
 
     def _save_prediction_details(self, indices, preds, trues, wrong_fp, result_fp):
+        # 这个方法保持不变
         if result_fp:
             try:
                 import csv # 确保导入
@@ -669,96 +633,193 @@ class Processor():
             except Exception as e: self.print_log(f"警告: 保存错误文件 {wrong_fp} 失败: {e}", logging.WARNING)
 
     def start(self):
-        final_score_path_for_main = None 
+        final_score_path_for_main = None
         if self.arg.phase == 'train':
             self.print_log('开始训练阶段...')
-            self.print_log(f'参数:\n{yaml.dump(vars(self.arg), default_flow_style=None, sort_keys=False, allow_unicode=True, Dumper=Dumper)}')
             self.print_log(f'模型可训练参数量: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}')
-            
-            num_epochs = int(self.arg.num_epoch); patience = getattr(self.arg, 'early_stop_patience', 0); patience_counter = 0
+
+            num_epochs = int(self.arg.num_epoch)
+            patience = getattr(self.arg, 'early_stop_patience', 0)
+            patience_counter = 0
             self.print_log(f"总训练 Epochs: {num_epochs}, 起始 Epoch: {self.arg.start_epoch + 1}")
             if patience > 0: self.print_log(f"启用 Early Stopping, patience={patience}")
 
             for epoch in range(self.arg.start_epoch, num_epochs):
                 self.train(epoch)
-                # 决定何时进行评估和保存最佳模型
                 perform_eval = (epoch + 1) % self.arg.eval_interval == 0 or (epoch + 1) == num_epochs
-                
+
                 if perform_eval:
-                    # 这里的 loader_name=['val'] 表示总是在验证集上评估来决定最佳模型
-                    val_acc, _ = self.eval(epoch, save_score_final_eval=False, loader_name=['val']) 
+                    # 始终在 'val' loader 上评估来更新最佳模型
+                    val_acc, _ = self.eval(epoch, save_score_final_eval=False, loader_name=['val'])
                     if val_acc > self.best_acc:
-                        self.best_acc, self.best_acc_epoch = val_acc, epoch + 1; patience_counter = 0
+                        self.best_acc, self.best_acc_epoch = val_acc, epoch + 1
+                        patience_counter = 0
                         best_model_path = os.path.join(self.arg.work_dir, 'best_model.pt')
                         try:
                             state_dict_to_save = self.model.module.state_dict() if isinstance(self.model, torch.nn.DataParallel) else self.model.state_dict()
                             torch.save(state_dict_to_save, best_model_path)
                             self.print_log(f'*** 新的最佳准确率: {self.best_acc*100:.2f}% (Epoch {self.best_acc_epoch}). 模型已保存到 {best_model_path} ***')
-                            # self.best_state_dict = OrderedDict([[k.replace('module.', ''), v.cpu()] for k, v in state_dict_to_save.items()]) # 可选
-                        except Exception as e: self.print_log(f"警告: 保存最佳模型失败: {e}", logging.WARNING)
-                    elif patience > 0 :
-                        patience_counter += 1; self.print_log(f'验证集准确率未提升. EarlyStopping Counter: {patience_counter}/{patience}')
-                        if patience_counter >= patience: self.print_log(f'触发 Early Stopping (Epoch {epoch + 1})'); break
+                        except Exception as e:
+                            self.print_log(f"警告: 保存最佳模型失败: {e}", logging.WARNING)
+                    elif patience > 0:
+                        patience_counter += 1
+                        self.print_log(f'验证集准确率未提升. EarlyStopping Counter: {patience_counter}/{patience}')
+                        if patience_counter >= patience:
+                            self.print_log(f'触发 Early Stopping (Epoch {epoch + 1})')
+                            break
             
             self.print_log('训练完成。')
+
+            # --- 训练结束后，加载最佳模型进行最终评估并保存分数 ---
             if self.best_acc_epoch > 0:
                 self.print_log(f'训练中最佳验证准确率 (Top-1): {self.best_acc*100:.2f}% (Epoch {self.best_acc_epoch}).')
                 best_model_path = os.path.join(self.arg.work_dir, 'best_model.pt')
                 if os.path.exists(best_model_path):
                     self.print_log(f'加载最佳模型 {best_model_path} 进行最终测试/分数保存...')
                     try:
-                        loaded_weights = torch.load(best_model_path, map_location=self.output_device)
-                        if isinstance(self.model, torch.nn.DataParallel) and not list(loaded_weights.keys())[0].startswith('module.'):
-                            loaded_weights = OrderedDict([('module.'+k, v) for k,v in loaded_weights.items()])
-                        elif not isinstance(self.model, torch.nn.DataParallel) and list(loaded_weights.keys())[0].startswith('module.'):
-                            loaded_weights = OrderedDict([(k.replace('module.',''),v) for k,v in loaded_weights.items()])
-                        self.model.load_state_dict(loaded_weights)
-                        self.print_log("最佳模型权重加载成功。")
+                        # 1. 加载权重到CPU以安全处理前缀
+                        loaded_weights = torch.load(best_model_path, map_location='cpu')
+
+                        # 2. 更稳健地处理 DataParallel 前缀
+                        # 当前的 self.model 实例在训练后应该是 DataParallel 包装的（如果你用了多GPU）
+                        is_current_model_dp = isinstance(self.model, torch.nn.DataParallel)
                         
-                        # 使用 'val' loader 或 'test' loader (如果配置了) 来保存最终分数
-                        # loader_for_final_scores = ['test'] if 'test' in self.data_loader else ['val']
-                        loader_for_final_scores = ['val'] # 假设我们总是在val集上生成最终分数给ensemble
-                        if 'test' in self.data_loader and self.arg.test_feeder_args.get('split') == 'test':
-                             loader_for_final_scores = ['test']
+                        # 检查加载的权重是否带有 'module.' 前缀
+                        # 需要注意，如果 loaded_weights 为空或不是字典，这里会出错，但 torch.load 通常返回字典
+                        keys_in_loaded_weight_start_with_module = False
+                        if loaded_weights and isinstance(loaded_weights, dict) and len(loaded_weights.keys()) > 0:
+                            keys_in_loaded_weight_start_with_module = list(loaded_weights.keys())[0].startswith('module.')
 
+                        final_weights_to_load = OrderedDict()
+                        if is_current_model_dp: # 当前模型是 DataParallel 实例
+                            if not keys_in_loaded_weight_start_with_module:
+                                # 模型是DP, 但权重文件中的键名不带 'module.' -> 给权重键名加上 'module.'
+                                self.print_log("  当前模型为 DataParallel，但加载的权重不含 'module.' 前缀。将为权重键名添加前缀。")
+                                for k, v in loaded_weights.items():
+                                    final_weights_to_load['module.' + k] = v
+                            else:
+                                # 模型是DP, 权重也是DP -> 直接使用
+                                self.print_log("  当前模型为 DataParallel，加载的权重已含 'module.' 前缀。直接使用。")
+                                final_weights_to_load = loaded_weights
+                        else: # 当前模型不是 DataParallel 实例
+                            if keys_in_loaded_weight_start_with_module:
+                                # 模型不是DP, 但权重文件中的键名带 'module.' -> 从权重键名移除 'module.'
+                                self.print_log("  当前模型非 DataParallel，但加载的权重含 'module.' 前缀。将从权重键名移除前缀。")
+                                for k, v in loaded_weights.items():
+                                    final_weights_to_load[k[7:]] = v # 移除 'module.'
+                            else:
+                                # 模型不是DP, 权重也不是DP -> 直接使用
+                                self.print_log("  当前模型非 DataParallel，加载的权重不含 'module.' 前缀。直接使用。")
+                                final_weights_to_load = loaded_weights
+                        
+                        # 3. 将处理好的权重加载到模型
+                        self.model.load_state_dict(final_weights_to_load)
+                        self.print_log("最佳模型权重已成功加载到 self.model。")
+                        
+                        # 4. !!! 关键：在进行任何评估之前，立即设置模型为评估模式 !!!
+                        self.model.eval()
+                        self.print_log(f"模型已设置为评估模式: model.training = {self.model.training}") # 应该输出 False
 
-                        wf = os.path.join(self.arg.work_dir, 'final_eval_wrong.txt') # 改名以区分
-                        rf = os.path.join(self.arg.work_dir, 'final_eval_results.csv')
-                        _, final_score_path_for_main = self.eval(
-                            epoch=self.best_acc_epoch -1, # epoch参数主要用于日志和tensorboard
-                            save_score_final_eval=getattr(self.arg, 'save_score', True), # 确保保存分数
-                            loader_name=loader_for_final_scores, 
+                        # 5. 确定评估用的loader
+                        # 为了调试，强制使用 'val' loader，与训练中获取 best_acc 时一致
+                        loader_for_final_scores = ['val']
+                        self.print_log(f"最终评估将强制使用 '{loader_for_final_scores}' loader 进行准确率对比。")
+
+                        wf = os.path.join(self.arg.work_dir, 'final_eval_best_model_wrong.txt')
+                        rf = os.path.join(self.arg.work_dir, 'final_eval_best_model_results.csv')
+                        
+                        # 调用 eval 进行最终评估
+                        # eval 方法内部也会调用 self.model.eval()，但在这里多调用一次是好的实践
+                        final_eval_acc_loaded_best, final_score_path_for_main = self.eval(
+                            epoch=self.best_acc_epoch -1, # epoch参数主要用于日志
+                            save_score_final_eval=getattr(self.arg, 'save_score', True), # 保存分数文件
+                            loader_name=loader_for_final_scores,
                             wrong_file=wf, result_file=rf
                         )
-                    except Exception as e: self.print_log(f"错误: 加载或评估最佳模型失败: {e}", logging.ERROR); traceback.print_exc()
-                else: self.print_log(f"警告: 最佳模型文件 {best_model_path} 未找到。", logging.WARNING)
-            else: self.print_log("训练中未记录有效的最佳模型。", logging.WARNING)
+                        self.print_log(f"加载最佳模型后，在 {loader_for_final_scores[0]} 上直接评估的准确率: {final_eval_acc_loaded_best*100:.2f}%")
+
+                    except Exception as e:
+                        self.print_log(f"错误: 加载或评估最佳模型时失败: {e}", logging.ERROR)
+                        traceback.print_exc()
+                else:
+                    self.print_log(f"警告: 最佳模型文件 {best_model_path} 未找到。", logging.WARNING)
+            else:
+                self.print_log("训练中未记录有效的最佳模型。", logging.WARNING)
 
         elif self.arg.phase == 'test':
             self.print_log('开始测试阶段...')
             if not self.arg.weights or not os.path.exists(self.arg.weights):
-                self.print_log(f"错误: 测试阶段必须指定有效的 --weights 文件路径。", logging.CRITICAL); return None
-            self.print_log(f'模型: {self.arg.model}, 权重: {self.arg.weights}')
+                self.print_log(f"错误: 测试阶段必须指定有效的 --weights 文件路径。", logging.CRITICAL)
+                return None
+            self.print_log(f'加载模型: {self.arg.model}, 测试权重: {self.arg.weights}')
+            
+            try:
+                # 1. 加载权重到CPU以安全处理前缀
+                loaded_weights = torch.load(self.arg.weights, map_location='cpu')
+
+                # 2. 更稳健地处理 DataParallel 前缀
+                is_current_model_dp = isinstance(self.model, torch.nn.DataParallel)
+                keys_in_loaded_weight_start_with_module = False
+                if loaded_weights and isinstance(loaded_weights, dict) and len(loaded_weights.keys()) > 0:
+                    keys_in_loaded_weight_start_with_module = list(loaded_weights.keys())[0].startswith('module.')
+                
+                final_weights_to_load = OrderedDict()
+                if is_current_model_dp:
+                    if not keys_in_loaded_weight_start_with_module:
+                        self.print_log("  测试阶段：当前模型为 DataParallel，但加载的权重不含 'module.' 前缀。将为权重键名添加前缀。")
+                        for k, v in loaded_weights.items(): final_weights_to_load['module.' + k] = v
+                    else:
+                        self.print_log("  测试阶段：当前模型为 DataParallel，加载的权重已含 'module.' 前缀。直接使用。")
+                        final_weights_to_load = loaded_weights
+                else:
+                    if keys_in_loaded_weight_start_with_module:
+                        self.print_log("  测试阶段：当前模型非 DataParallel，但加载的权重含 'module.' 前缀。将从权重键名移除前缀。")
+                        for k, v in loaded_weights.items(): final_weights_to_load[k[7:]] = v
+                    else:
+                        self.print_log("  测试阶段：当前模型非 DataParallel，加载的权重不含 'module.' 前缀。直接使用。")
+                        final_weights_to_load = loaded_weights
+                
+                self.model.load_state_dict(final_weights_to_load)
+                self.print_log("测试权重已成功加载到 self.model。")
+
+                # 3. !!! 关键：设置模型为评估模式 !!!
+                self.model.eval()
+                self.print_log(f"测试阶段：模型已设置为评估模式: model.training = {self.model.training}")
+
+            except Exception as e:
+                self.print_log(f"错误: 测试阶段加载权重失败: {e}", logging.CRITICAL)
+                traceback.print_exc()
+                return None
+
             base_name = os.path.basename(self.arg.weights).replace('.pt','')
             wf = os.path.join(self.arg.work_dir, f'{base_name}_wrong.txt')
             rf = os.path.join(self.arg.work_dir, f'{base_name}_results.csv')
             
-            # 在测试阶段，使用 'test' loader (如果存在) 或 'val' loader
-            loader_for_test_phase = ['test'] if 'test' in self.data_loader else ['val']
+            loader_for_test_phase = ['val'] # 默认使用 'val' loader
+            if 'test' in self.data_loader and self.arg.test_feeder_args.get('split') == 'test':
+                loader_for_test_phase = ['test']
+            self.print_log(f"测试阶段将使用 loader: {loader_for_test_phase}")
 
-            _, final_score_path_for_main = self.eval(
-                epoch=0, # 对于测试阶段，epoch可以设为0
-                save_score_final_eval=getattr(self.arg, 'save_score', True), # 确保保存分数
-                loader_name=loader_for_test_phase, 
+
+            test_acc, final_score_path_for_main = self.eval(
+                epoch=self.best_acc_epoch if hasattr(self, 'best_acc_epoch') else 0, # 使用最佳epoch或0
+                save_score_final_eval=getattr(self.arg, 'save_score', True),
+                loader_name=loader_for_test_phase,
                 wrong_file=wf, result_file=rf
             )
-            self.print_log('测试完成。')
+            self.print_log(f'测试完成。在 {loader_for_test_phase[0]} 上的准确率: {test_acc*100:.2f}%')
         
         elif self.arg.phase == 'model_size':
              self.print_log(f'模型总参数量: {sum(p.numel() for p in self.model.parameters()):,}')
              self.print_log(f'模型可训练参数量: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}')
-        else: self.print_log(f"未知的运行阶段: {self.arg.phase}", logging.ERROR)
+        else:
+            self.print_log(f"未知的运行阶段: {self.arg.phase}", logging.ERROR)
 
-        if self.train_writer: self.train_writer.close()
-        if self.val_writer: self.val_writer.close()
+        if hasattr(self, 'train_writer') and self.train_writer: # 检查属性是否存在
+            try: self.train_writer.close()
+            except Exception: pass
+        if hasattr(self, 'val_writer') and self.val_writer: # 检查属性是否存在
+            try: self.val_writer.close()
+            except Exception: pass
+            
         return final_score_path_for_main

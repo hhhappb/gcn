@@ -1,0 +1,137 @@
+# YAML 配置文件: config/shrec17/shrec17_sdtgru_P1B_v1.yaml (新文件名)
+
+# --- 常规/项目设置 ---
+work_dir: ./work_dir/shrec17 class14 5.21
+seed: 1
+device: [0, 1]
+
+# --- 数据设置 ---
+feeder: feeders.feeder_shrec17.Feeder # 保持不变
+modalities: ['joint', 'bone', 'joint_motion'] # 保持不变
+base_channel: 3 # 保持不变
+label_file: 'data/shrec/shrec17_jsons/test_samples.json' # 保持不变
+
+train_feeder_args:
+  root_dir: 'data/shrec/shrec17_jsons'
+  list_file: 'data/shrec/shrec17_jsons/train_samples.json'
+  split: 'train'
+  label_type: 'label_14'
+  max_len: 180                    
+  data_path: 'joint,bone,joint_motion' 
+  repeat: 5
+  random_choose: true
+  apply_random_translation: true 
+  num_classes: 14
+  num_nodes: 22                      
+
+test_feeder_args:
+  root_dir: 'data/shrec/shrec17_jsons'
+  list_file: 'data/shrec/shrec17_jsons/test_samples.json'
+  split: 'val' # 通常用 'val' 或 'test'
+  label_type: 'label_14'
+  max_len: 180                  
+  data_path: 'joint,bone,joint_motion'
+  repeat: 1
+  random_choose: false
+  apply_random_translation: false
+  num_classes: 14
+  num_nodes: 22                      
+
+# --- 模型设置 ---
+model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier
+model_args:
+  # --- 基础配置 (来自SHREC17原配置) ---
+  num_nodes: 22
+  num_classes: 14
+  max_seq_len: 180    # <<<--- 与feeder一致
+
+  # --- GRU/RNN 相关配置 (参考你原SHREC17配置，并适配新模型) ---
+  num_rnn_layers: 2
+  num_rnn_units: 128       # 原配置值，对于SHREC17可能需要小一点的模型
+  rnn_dropout_rate: 0.15   # 原配置值
+  zoneout_rate: 0.15       # <<< 新增：可以从一个合理的值开始，例如 0.1 或 0.15
+
+  # +++ TA-Inspired Module 配置 (新增) +++
+  use_ta_inspired_module: true       # <<< 设为 true 以启用
+  ta_inspired_mlp_hidden_ratio: 0.25 # (128 * 0.25 = 32)
+
+  # +++ P1.B 分层多尺度时间注意力配置 (新增) +++
+  use_temporal_multiscale_hierarchical: true # <<< 设为 true 以启用
+  num_temporal_scales: 3                     # 例如: S0, S1, S2
+  temporal_scale_kernel_size: 5              # 下采样卷积的核大小
+  temporal_scale_stride: 2                   # 每次下采样的基础步长
+  fusion_mlp_attn1_hidden_dim: 128           # 假设 num_rnn_units=128
+  fusion_mlp_attn2_hidden_dim: 128           # 假设 num_rnn_units=128
+  
+  # -- 参数 for 局部注意力路径 (Local Path) --
+  # 需要根据 num_rnn_units=128 和 SHREC17 的特点调整
+  sa_local_st_layers: 1           
+  sa_local_n_heads: 8             # <<< 调整 (128/8 = 16)
+  sa_local_ffn_dim: 256           # <<< 调整 (128*2)
+  sa_local_dropout_rate: 0.1      # 可以保持或微调
+  sa_local_qkv_bias: false        # 原配置中没有，默认为false
+  sa_local_use_conv_proj: true    # 原配置中是 use_conv_proj
+  sa_local_conv_kernel_size: 3    # 原配置中是 conv_kernel_size
+
+  # -- 参数 for 全局注意力路径 (Global Path) --
+  sa_global_st_layers: 1          # 原配置中 st_layers 可能是指这个，设为1层先
+  sa_global_n_heads: 8            # <<< 调整 (128/8 = 16), 原配置 n_heads
+  sa_global_ffn_dim: 256          # <<< 调整 (128*2), 原配置 ffn_dim
+  sa_global_dropout_rate: 0.15    # 原配置 st_dropout_rate 可能对应这里的dropout
+  sa_global_qkv_bias: false       # 原配置 qkv_bias
+  sa_global_use_conv_proj: true   # 原配置 use_conv_proj
+  sa_global_conv_kernel_size: 7   # <<< 尝试一个比局部略大的值，原配置是3
+  sa_global_use_global_spatial_bias: true # 建议启用
+
+  # -- 局部注意力邻接矩阵相关 --
+  local_adj_k_hop: 1 # SHREC17的邻接矩阵可能需要专门定义，或用1-hop通用
+
+  # -- 融合策略与参数 --
+  spatial_fusion_type: 'dynamic_gate' 
+  spatial_fusion_gate_hidden_dim: 32 # <<< 配合 num_rnn_units=128 (128 // 4)
+
+  # --- 时间注意力 (TemporalTransformerBlock) 配置 ---
+  use_temporal_attn: true        # 原配置值
+  num_temporal_layers: 2 
+  temporal_n_heads: 8            # 原配置值 (128/8 = 16)
+  temporal_ffn_dim: 512          # <<< 调整 (128*2), 原配置是512 (128*4)
+  temporal_dropout_rate: 0.15    # 原配置值
+  
+  # --- 分类头与输出配置 ---
+  classifier_hidden_dim: 64    # 原配置值
+  classifier_dropout: 0.4      # 原配置值
+  use_gap: true                # 原配置值
+  output_attention: false      # 原配置值
+
+# --- 优化器与学习率 (保持你之前的设置) ---
+optimizer: AdamW
+base_lr: 0.001
+weight_decay: 0.05
+
+# --- 学习率调度器 ---
+lr_scheduler: multistep
+step: [50, 70]
+lr_decay_rate: 0.1
+warm_up_epoch: 20
+
+# --- 训练与测试流程配置 ---
+batch_size: 128            
+test_batch_size: 128      
+num_epoch: 100
+num_worker: 16
+loss_type: SmoothCE
+
+# --- 梯度裁剪 ---
+grad_clip: false # 保持不变
+
+# --- 日志与保存 ---
+log_interval: 50
+eval_interval: 1
+save_interval: 0
+save_epoch: 0
+print_log: true
+save_score: true
+show_topk: [1]
+
+# --- 早停 ---
+early_stop_patience: 20 

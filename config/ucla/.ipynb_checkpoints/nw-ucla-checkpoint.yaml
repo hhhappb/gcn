@@ -1,0 +1,115 @@
+# --- 主工作目录 ---
+work_dir: ./work_dir/ucla_sdtgru_gat_4modal_bs256 # <<<--- 修改目录名，反映 GAT 和原始 BS
+
+# --- 指定要融合训练的模态 ---
+modalities: ['joint', 'bone', 'joint_motion', 'bone_motion'] # <<<--- 保持四模态
+base_channel: 3
+
+# --- 测试集标签文件 ---
+label_file: 'data/nw-ucla/val_label.pkl' # 确保路径正确
+
+
+# --- 数据加载器通用配置 (Feeder) ---
+feeder: feeders.feeder_ucla.Feeder # 使用 UCLA 的 Feeder
+train_feeder_args:
+  root_dir: 'data/nw-ucla/all_sqe/all_sqe/'
+  split: 'train'
+  repeat: 5
+  random_choose: true
+  window_size: 64
+  apply_rand_view_transform: true
+  center_joint_idx: 1
+  num_classes: 10
+  max_len: 64
+  data_path: 'joint,bone,joint_motion,bone_motion' # 匹配 modalities
+  # --- (可选) 保持或调整针对性增强 ---
+  augment_confused_classes: true
+  confused_classes_list: [0, 3, 8, 9]
+  confused_rotation_range: [-60, 60]
+  confused_scale_range: [0.5, 1.5]
+  add_gaussian_noise: false
+test_feeder_args:
+  root_dir: 'data/nw-ucla/all_sqe/all_sqe/'
+  split: 'val'
+  repeat: 1
+  random_choose: false
+  window_size: 64
+  apply_rand_view_transform: false
+  center_joint_idx: 1
+  val_pkl_path: 'data/nw-ucla/val_label.pkl'
+  num_classes: 10
+  max_len: 64
+  data_path: 'joint,bone,joint_motion,bone_motion' # 匹配 modalities
+  augment_confused_classes: false
+  add_gaussian_noise: false
+
+
+# --- 模型配置 (使用修改后的 GAT 版本 SDT-GRU) ---
+model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier # <<<--- 确保指向包含 GAT 的模型代码
+model_args:
+  # num_input_dim: 12 # 由 main.py 计算
+  num_nodes: 20
+  num_classes: 10
+  max_seq_len: 64
+  # --- 其他 SDT-GRU 参数 ---
+  num_rnn_layers: 2
+  num_rnn_units: 128
+  n_heads: 8          # GAT 头数
+  ffn_dim: 256
+  st_layers: 2
+  st_dropout_rate: 0.15 # 这个会传递给 GAT EncoderLayer 里的 DropPath
+  rnn_dropout_rate: 0.15
+  classifier_dropout: 0.4
+  use_temporal_attn: true
+  num_temporal_layers: 1
+  temporal_n_heads: 8
+  temporal_ffn_dim: 512
+  temporal_dropout_rate: 0.15 # 这个会传递给 Temporal Block DropPath
+  use_gap: true
+  classifier_hidden_dim: 64
+  use_conv_proj: true
+  conv_kernel_size: 3
+  qkv_bias: false
+  output_attention: false
+
+  # <<<--- 添加 GAT 相关参数 --- >>>
+  attn_dropout: 0.1                 # 控制 GAT 注意力权重的 dropout (默认或指定)
+  leaky_relu_negative_slope: 0.2    # LeakyReLU 斜率 (默认或指定)
+  # <<<------------------------ >>>
+
+# --- 优化器与学习率 (保持不变) ---
+optimizer: AdamW
+base_lr: 0.001
+weight_decay: 0.05
+
+# --- 学习率调度器 (保持不变) ---
+lr_scheduler: multistep
+step: [50, 70]
+lr_decay_rate: 0.1
+warm_up_epoch: 15
+
+# --- 训练与测试流程配置 ---
+batch_size: 192           # <<<--- 保持原来的 256
+test_batch_size: 256      # <<<--- 保持原来的 256
+num_epoch: 100
+num_worker: 32
+loss_type: SmoothCE
+
+# --- 梯度裁剪 ---
+grad_clip: false
+
+# --- 日志与保存 ---
+log_interval: 50
+eval_interval: 1
+save_interval: 0
+save_epoch: 0
+print_log: true
+save_score: true
+show_topk: [1]
+
+# --- 早停 ---
+early_stop_patience: 30
+
+# --- 设备和种子 ---
+device: [0]
+seed: 1

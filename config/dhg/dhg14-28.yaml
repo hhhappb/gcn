@@ -1,107 +1,104 @@
-# --- 主工作目录 (需要根据 subject_idx 变化) ---
-# work_dir: ./work_dir/dhg14_28_sdtgru_14class_s{subject_idx} # 脚本中动态设置或手动更改
-work_dir: ./work_dir/dhg14_28_sdtgru_14class_s1 # 示例：subject 1 作为验证集
+# --- 主工作目录 ---
+work_dir: ./work_dir/dhg14_28_sdtgru_14class_s1_dim128 # 修改工作目录名以反映配置变化
 
 # --- 指定要融合训练的模态 ---
-modalities: ['joint', 'bone', 'joint_motion'] # <<<--- 从单模态 joint 开始
+modalities: ['joint', 'bone', 'joint_motion']
 base_channel: 3
 
 # --- 数据加载器配置 ---
-feeder: feeders.feeder_dhg14_28.Feeder # <<<--- 使用适配 SDT-GRU 的 DHG Feeder
+feeder: feeders.feeder_dhg14_28.Feeder
 train_feeder_args:
-  root_dir: 'data/DHG14-28/DHG14-28_sample_json' # <<<--- DHG 数据根目录
-  split: 'train'                          # <<<--- 使用 split 参数
-  subject_idx: 1                        # <<<--- 需要在运行时传入或为每个 fold 修改 (1-20)
-  label_type: 'label_14'               # <<<--- 改为 14 类
-  max_len: 150                         # <<<--- 窗口大小/序列长度 (150)
-  data_path: 'joint,bone,joint_motion'                   # 匹配 modalities
-  repeat: 5                            # <<<--- 保持 repeat=5 (或改为 1 减少训练时间)
-  random_choose: true                  # 时间采样
-  # --- 配置通用增强 (从弱到强尝试) ---
-  apply_rand_view_transform: true    # 旋转缩放 (建议开启)
-  center_joint_idx: 0                  # DHG 中心点索引 (需确认)
-  apply_random_shear: false          # 默认关闭
-  apply_random_flip: false             # DHG 禁用翻转
-  apply_coord_drop: false            # 默认关闭
-  apply_joint_drop: false            # 默认关闭
-test_feeder_args:
-  root_dir: 'data/DHG14-28/DHG14-28_sample_json'
-  split: 'val'                         # 使用 split 参数
-  subject_idx: 1                        # <<<--- 需要在运行时传入或为每个 fold 修改 (1-20)
-  label_type: 'label_14'               # <<<--- 改为 14 类
+  root_dir: 'data/DHG14-28/DHG14-28_preprocessed_npy'
+  original_sample_list_root_dir: 'data/DHG14-28/DHG14-28_sample_json'
+  split: 'train'
+  subject_idx: 1
+  label_type: 'label_14'
   max_len: 150
   data_path: 'joint,bone,joint_motion'
+  base_channel: 3
+  repeat: 1
+  random_choose: true
+  center_joint_idx: 0
+  # num_classes: 14 # Feeder 会自行推断或从 model_args 获取
+
+test_feeder_args:
+  root_dir: 'data/DHG14-28/DHG14-28_preprocessed_npy'
+  original_sample_list_root_dir: 'data/DHG14-28/DHG14-28_sample_json'
+  split: 'val'
+  subject_idx: 1
+  label_type: 'label_14'
+  max_len: 150
+  data_path: 'joint,bone,joint_motion'
+  base_channel: 3
   repeat: 1
   random_choose: false
-  apply_rand_view_transform: false
   center_joint_idx: 0
-  # 测试时不应用随机增强
-  apply_random_shear: false
-  apply_random_flip: false
-  apply_coord_drop: false
-  apply_joint_drop: false
+  # num_classes: 14
 
-# --- 模型配置 (使用 SDT-GRU) ---
-model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier # 使用你的 SDT-GRU 模型
+# --- 模型配置 (SDT-GRU，降低维度) ---
+model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier
 model_args:
-  # num_input_dim: 3 # 由 main.py 计算
-  num_nodes: 22       # DHG 节点数
-  num_classes: 14     # <<<--- 改为 14 类
-  max_seq_len: 150    # 匹配 feeder max_len
-  # --- SDT-GRU 模型参数 (建议从较小容量开始) ---
-  num_rnn_layers: 2
-  num_rnn_units: 192   # 从 128 开始
-  n_heads: 8
-  ffn_dim: 382
-  st_layers: 2
-  st_dropout_rate: 0.2 # 从适中 Dropout 开始
-  rnn_dropout_rate: 0.2
-  classifier_dropout: 0.4
-  use_temporal_attn: true
+  # num_input_dim: 由 main.py 计算
+  num_nodes: 22
+  num_classes: 14
+  max_seq_len: 150
+  # --- 降低维度的 SDT-GRU 模型参数 ---
+  num_rnn_layers: 2         # 可以考虑先降为 1
+  num_rnn_units: 128        # <<<--- 核心修改：降低到 128
+  n_heads: 8                # 可以考虑降为 4
+  ffn_dim: 256              # <<<--- 配套修改：num_rnn_units * 2
+  st_layers: 1              # <<<--- 配套修改：减少空间注意力层数
+  st_dropout_rate: 0.15     # 可以适当调整
+  rnn_dropout_rate: 0.15    # 可以适当调整
+  classifier_dropout: 0.3   # 可以适当调整
+  use_temporal_attn: true   # 保持开启，如果速度仍然是首要问题，可以设为 false
   num_temporal_layers: 1
-  temporal_n_heads: 8
-  temporal_ffn_dim: 768
-  temporal_dropout_rate: 0.2
+  temporal_n_heads: 4       # <<<--- 配套修改：减少时间注意力头数
+  temporal_ffn_dim: 512     # <<<--- 配套修改：num_rnn_units (128) * 4
+  temporal_dropout_rate: 0.15 # 可以适当调整
   use_gap: true
-  classifier_hidden_dim: 64
-  use_conv_proj: true
+  classifier_hidden_dim: 64 # 或者考虑 128/2 = 64
+  use_conv_proj: true       # 如果速度是极致追求，可设为 false
   conv_kernel_size: 3
   qkv_bias: false
   output_attention: false
 
-# --- 优化器与学习率 (借鉴 TD-GCN) ---
-optimizer: SGD            # <<<--- 使用 SGD
-base_lr: 0.001              # <<<--- 使用 0.1
-weight_decay: 0.002      # <<<--- 使用 0.0001
-nesterov: True            # <<<--- 使用 Nesterov
+# --- 优化器与学习率 ---
+optimizer: SGD
+base_lr: 0.05             # <<<--- 对于 SGD 和 warmup，目标学习率可以设置稍高一些
+weight_decay: 0.0002
+nesterov: True
 
-# --- 学习率调度器 (借鉴 TD-GCN) ---
-lr_scheduler: multistep
-step: [80, 120]           # <<<--- 使用 [90, 130]
-lr_decay_rate: 0.1
-warm_up_epoch: 25         # <<<--- 使用 20
+# --- 学习率调度器 ---
+lr_scheduler: cosine      # <<<--- 强烈建议使用 cosine 调度器配合 warmup
+# step: [80, 120]         # cosine 调度器不需要 step
+# lr_decay_rate: 0.1      # cosine 调度器不需要 lr_decay_rate
+min_lr: 0.00001           # 余弦退火的最小学习率
+warm_up_epoch: 5          # <<<--- 对于 iteration-level warmup，5 个 epoch 通常足够
+warmup_lr: 0.00001        # warmup 开始时的学习率
+warmup_prefix: true       # 确保 Processor 中 timm scheduler 的 warmup_prefix 生效
 
-# --- 训练与测试流程配置 (借鉴 TD-GCN) ---
-batch_size: 64            # <<<--- 使用 32
-test_batch_size: 128       # <<<--- 测试时可以稍大
-num_epoch: 150            # <<<--- 使用 150
-num_worker: 32       
-loss_type: CE             # <<<--- 使用标准交叉熵
+# --- 训练与测试流程配置 ---
+batch_size: 170           # <<<--- 提高训练批次大小
+test_batch_size: 256      # <<<--- 测试批次大小也可以相应提高
+num_epoch: 150
+num_worker: 8             # 保持或适当调整 (4-8)
+loss_type: CE
 
 # --- 梯度裁剪 ---
-grad_clip: false        
+grad_clip: false
 
 # --- 日志与保存 ---
 log_interval: 50
-eval_interval: 1          # 每 5 轮评估
-save_interval: 0          # 只保存最佳
+eval_interval: 1
+save_interval: 0
 save_epoch: 0
 print_log: true
-save_score: true          # 交叉验证需要保存分数
+save_score: true
 show_topk: [1]
 
 # --- 早停 ---
-early_stop_patience: 0   
+early_stop_patience: 0
 
 # --- 设备和种子 ---
 device: [0]
