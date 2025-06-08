@@ -10,10 +10,18 @@ import yaml # 保留yaml用于打印配置
 import logging
 from einops import rearrange
 from typing import Optional, Tuple, List # 用于类型注解
+import numpy as np
+def import_class(name):
+    components = name.split('.')
+    mod = __import__(components[0])
+    for comp in components[1:]:
+        mod = getattr(mod, comp)
+    return mod
+
 
 # 尝试导入 timm 的 DropPath 和 trunc_normal_，如果失败则使用内置替代
 try:
-    from timm.models.layers import trunc_normal_, DropPath
+    from timm.layers import trunc_normal_, DropPath, Mlp
 except ImportError:
     print("警告: 无法从 timm 导入 DropPath 或 trunc_normal_。将使用内置简化版本。")
     class DropPath(nn.Module): # 定义一个简单的DropPath替代品
@@ -68,10 +76,15 @@ class AttentionLayer(nn.Module):
     """
     空间注意力层，用于处理单帧内骨骼节点间的关系。
     支持多种配置，如卷积投影、相对位置偏置、局部/全局注意力等。
+    新增：支持动态邻接偏置 (类似Q的概念)。
     """
     def __init__(self, d_model, n_heads, dropout, output_attention=False,
                  qkv_bias=False, use_conv_proj=True, conv_kernel_size=3, num_nodes=20,
-                 use_global_spatial_bias=False, attention_type='global', adj_matrix_for_local=None):
+                 use_global_spatial_bias=False, attention_type='global', adj_matrix_for_local=None,
+                 # 新增参数用于动态邻接偏置 (Q-like bias)
+                 use_dynamic_adj_bias: bool = False,
+                 d_q_intermediate: int = None, # 动态偏置计算的中间维度
+                 q_dropout_rate: float = 0.0): # 动态偏置计算中的dropout
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError(f"特征维度 d_model ({d_model}) 必须能被注意力头数 n_heads ({n_heads}) 整除")
@@ -98,7 +111,6 @@ class AttentionLayer(nn.Module):
             self.query_projection = nn.Conv1d(d_model, d_model, kernel_size=conv_kernel_size, padding=padding, bias=qkv_bias)
             self.key_projection = nn.Conv1d(d_model, d_model, kernel_size=conv_kernel_size, padding=padding, bias=qkv_bias)
             self.value_projection = nn.Conv1d(d_model, d_model, kernel_size=conv_kernel_size, padding=padding, bias=qkv_bias)
-            # 卷积投影后通常会接LayerNorm和残差连接
             self.resid_norm_q = nn.LayerNorm(d_model)
             self.resid_norm_k = nn.LayerNorm(d_model)
             self.resid_norm_v = nn.LayerNorm(d_model)
@@ -107,7 +119,7 @@ class AttentionLayer(nn.Module):
             self.key_projection = nn.Linear(d_model, d_model, bias=qkv_bias)
             self.value_projection = nn.Linear(d_model, d_model, bias=qkv_bias)
 
-        # 相对位置偏置 (学习节点间的相对空间关系)
+        # 相对位置偏置
         if num_nodes > 0:
             self.relative_position_bias_table = nn.Parameter(torch.zeros((2 * num_nodes - 1), n_heads))
             trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -118,101 +130,123 @@ class AttentionLayer(nn.Module):
             self.relative_position_bias_table = None
             self.register_buffer("relative_position_index", None, persistent=False)
 
-        self.out_projection = nn.Linear(d_model, d_model) # 注意力输出后的最终投影
-        self.dropout = nn.Dropout(dropout) # 应用于注意力权重 softmax(scores) 之后
+        self.out_projection = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
 
-        # 全局可学习的空间偏置 (如果启用)
+        # 全局可学习的空间偏置
         if self.use_global_spatial_bias and self.attention_type == 'global' and num_nodes > 0:
             self.global_spatial_bias = nn.Parameter(torch.zeros(n_heads, num_nodes, num_nodes))
-            self.alpha_global_bias = nn.Parameter(torch.tensor(1.0)) # 偏置的缩放因子
+            self.alpha_global_bias = nn.Parameter(torch.tensor(1.0))
             trunc_normal_(self.global_spatial_bias, std=.02)
         else:
             self.global_spatial_bias = None
             self.alpha_global_bias = None
 
-        # 局部连接偏置 (如果启用，用于局部注意力)
-        if self.attention_type == 'local' and num_nodes > 0:
+        # 局部连接偏置
+        if self.attention_type == 'local' and num_nodes > 0: # 即使是局部注意力，也可能有一个静态的、可学习的偏置
             self.local_connection_bias = nn.Parameter(torch.zeros(self.n_heads, self.num_nodes, self.num_nodes))
+            # trunc_normal_(self.local_connection_bias, std=.02) # 可以选择初始化方式
         else:
             self.local_connection_bias = None
 
-    def _get_relative_positional_bias(self) -> torch.Tensor:
-        """计算并返回相对位置偏置，形状为 (1, H, N, N)"""
-        if self.relative_position_bias_table is None or self.relative_position_index is None:
-            return 0.0 # 如果没有配置，则偏置为0
-        # self.relative_position_index 是 (N, N)
-        # self.relative_position_bias_table 是 (2N-1, H)
-        idx = self.relative_position_index.view(-1).to(self.relative_position_bias_table.device) # (N*N)
-        # 从表中查找偏置
-        relative_position_bias = self.relative_position_bias_table[idx] # (N*N, H)
-        relative_position_bias = relative_position_bias.view(self.num_nodes, self.num_nodes, self.n_heads) # (N, N, H)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous() # (H, N, N)
-        return relative_position_bias.unsqueeze(0) # (1, H, N, N) 以便广播
+        # --- 新增：动态邻接偏置 (Q-like bias) 的初始化 ---
+        self.use_dynamic_adj_bias = use_dynamic_adj_bias
+        if self.use_dynamic_adj_bias:
+            self.d_q_intermediate = d_q_intermediate
+            if self.d_q_intermediate is None or self.d_q_intermediate <= 0:
+                self.d_q_intermediate = max(16, d_model // 4) # 默认中间维度
+                # model_logger.info(f"AttentionLayer: d_q_intermediate for dynamic bias not provided or invalid, set to {self.d_q_intermediate}")
+            
+            self.q_feat_projection = nn.Linear(d_model, self.d_q_intermediate)
+            self.q_pairwise_bias_projection = nn.Linear(self.d_q_intermediate, self.n_heads) # 输出每个头的偏置
+            self.q_activation = nn.Tanh() # 激活函数，使得偏置值有正有负
+            if q_dropout_rate > 0:
+                self.q_dropout = nn.Dropout(q_dropout_rate)
+            # model_logger.info(f"AttentionLayer: Dynamic Adjacency Bias enabled (intermediate_dim={self.d_q_intermediate}, dropout={q_dropout_rate}).")
+        # --- 结束新增 ---
 
-    def forward(self, x): # x 输入形状: (B, N, D) - B:批次大小, N:节点数, D:特征维度
+    def _get_relative_positional_bias(self) -> torch.Tensor:
+        if self.relative_position_bias_table is None or self.relative_position_index is None:
+            return 0.0
+        idx = self.relative_position_index.view(-1).to(self.relative_position_bias_table.device)
+        relative_position_bias = self.relative_position_bias_table[idx]
+        relative_position_bias = relative_position_bias.view(self.num_nodes, self.num_nodes, self.n_heads)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        return relative_position_bias.unsqueeze(0)
+
+    def forward(self, x): # x 输入形状: (B, N, D)
         B, N, D = x.shape; H = self.n_heads
         if N != self.num_nodes:
             raise ValueError(f"输入节点维度 {N} 与 AttentionLayer 初始化的 num_nodes ({self.num_nodes}) 不符")
 
-        # 1. QKV投影
         if self.use_conv_proj:
-            x_permuted = x.permute(0, 2, 1).contiguous() # (B, D, N) 以适配Conv1d
-            q_conv = self.query_projection(x_permuted)   # (B, D, N)
-            k_conv = self.key_projection(x_permuted)   # (B, D, N)
-            v_conv = self.value_projection(x_permuted)   # (B, D, N)
-            # 转换回 (B, N, D) 并进行 LayerNorm 和残差连接
+            x_permuted = x.permute(0, 2, 1).contiguous()
+            q_conv = self.query_projection(x_permuted)
+            k_conv = self.key_projection(x_permuted)
+            v_conv = self.value_projection(x_permuted)
             q_normed = self.resid_norm_q(q_conv.permute(0, 2, 1).contiguous())
             k_normed = self.resid_norm_k(k_conv.permute(0, 2, 1).contiguous())
             v_normed = self.resid_norm_v(v_conv.permute(0, 2, 1).contiguous())
-            # 残差连接：原始输入 x 加上经过卷积和归一化处理的变换结果
             queries_proj = x + q_normed
             keys_proj = x + k_normed
             values_proj = x + v_normed
-        else: # 使用线性投影
+        else:
              queries_proj = self.query_projection(x)
              keys_proj = self.key_projection(x)
              values_proj = self.value_projection(x)
 
-        # 2. 将QKV分割到多头
-        # (B, N, D) -> (B, N, H, D_head) -> (B, H, N, D_head)
         queries = queries_proj.view(B, N, H, self.d_keys).permute(0, 2, 1, 3)
         keys = keys_proj.view(B, N, H, self.d_keys).permute(0, 2, 1, 3)
         values = values_proj.view(B, N, H, self.d_values).permute(0, 2, 1, 3)
 
-        # 3. 计算注意力分数
-        # (B,H,N,D_k) @ (B,H,D_k,N) -> (B,H,N,N)
         scores = torch.matmul(queries, keys.transpose(-2, -1))
-        scores = scores / math.sqrt(self.d_keys) # 缩放因子
+        scores = scores / math.sqrt(self.d_keys)
 
-        # 4. 添加各种偏置
         if self.relative_position_bias_table is not None:
-            scores = scores + self._get_relative_positional_bias() # (1,H,N,N)
+            scores = scores + self._get_relative_positional_bias()
 
         if self.attention_type == 'global' and self.global_spatial_bias is not None:
-            # self.global_spatial_bias 是 (H,N,N)，需要扩展到 (1,H,N,N)
             scores = scores + self.global_spatial_bias.unsqueeze(0) * self.alpha_global_bias
 
         if self.attention_type == 'local' and self.local_connection_bias is not None:
-            # self.local_connection_bias 是 (H,N,N)
-            scores = scores + self.local_connection_bias.unsqueeze(0)
+            scores = scores + self.local_connection_bias.unsqueeze(0) # 添加静态的局部连接偏置
 
-        # 5. 应用局部注意力掩码 (如果配置)
+        # --- 新增：计算并添加动态邻接偏置 ---
+        if self.use_dynamic_adj_bias:
+            # x 的形状是 (B, N, D)
+            q_node_features = self.q_feat_projection(x)  # (B, N, d_q_intermediate)
+
+            # 计算成对特征差异
+            q_feat_i = q_node_features.unsqueeze(2)  # (B, N, 1, d_q_intermediate)
+            q_feat_j = q_node_features.unsqueeze(1)  # (B, 1, N, d_q_intermediate)
+            # 广播相减得到 (B, N, N, d_q_intermediate)
+            pairwise_q_relations = q_feat_i - q_feat_j 
+            
+            pairwise_q_relations_activated = self.q_activation(pairwise_q_relations)
+
+            if hasattr(self, 'q_dropout'): # 检查 q_dropout 是否已定义 (基于 q_dropout_rate > 0)
+                pairwise_q_relations_activated = self.q_dropout(pairwise_q_relations_activated)
+
+            # 将成对关系投影到每个头的偏置
+            # 输入 (B, N, N, d_q_intermediate), 输出 (B, N, N, n_heads)
+            dynamic_adj_bias_unpermuted = self.q_pairwise_bias_projection(pairwise_q_relations_activated)
+            
+            # 转换维度以匹配 scores (B, n_heads, N, N)
+            dynamic_adj_bias = dynamic_adj_bias_unpermuted.permute(0, 3, 1, 2) # (B, n_heads, N, N)
+            
+            scores = scores + dynamic_adj_bias # 将学习到的动态偏置加到注意力分数上
+        # --- 结束新增 ---
+
         if self.attention_type == 'local' and self.adj_matrix_for_local is not None:
-            # adj_matrix_for_local 是 (N,N)，True表示连接
-            # 我们需要一个掩码，其中非连接处为 -inf。所以对 adj.logical_not() 进行扩展
-            local_mask = self.adj_matrix_for_local.logical_not().unsqueeze(0).unsqueeze(0) # (1,1,N,N)
+            local_mask = self.adj_matrix_for_local.logical_not().unsqueeze(0).unsqueeze(0)
             scores = scores.masked_fill(local_mask, float('-inf'))
 
-        # 6. 计算注意力权重并应用dropout
-        attn_weights = torch.softmax(scores, dim=-1) # (B,H,N,N)
+        attn_weights = torch.softmax(scores, dim=-1)
         attn_weights_dropped = self.dropout(attn_weights)
 
-        # 7. 加权求和V，并进行输出投影
-        # (B,H,N,N) @ (B,H,N,D_v) -> (B,H,N,D_v)
         weighted_values = torch.matmul(attn_weights_dropped, values)
-        # (B,H,N,D_v) -> (B,N,H,D_v) -> (B,N, H*D_v = D)
         weighted_values = weighted_values.permute(0, 2, 1, 3).contiguous().view(B, N, -1)
-        output = self.out_projection(weighted_values) # (B,N,D)
+        output = self.out_projection(weighted_values)
 
         return output, attn_weights.detach() if self.output_attention else None
 
@@ -458,11 +492,64 @@ class SDT_BiGRU_Classifier(nn.Module):
         super().__init__()
         # model_logger.info(f"模型配置 (model_cfg): \n{yaml.dump(model_cfg, indent=2, sort_keys=False)}") # 可选：打印完整配置
 
+        # --- 0. 图的初始化 ---
+        graph_class_str = model_cfg.get('graph_class') # 例如: "graph.ucla.Graph"
+        graph_args_cfg = model_cfg.get('graph_args', {})   # 例如: {"labeling_mode": "spatial"}
+
+        if not graph_class_str:
+            raise ValueError("模型配置 'model_cfg' 中必须包含 'graph_class' (图类的导入路径)。")
+
+        try:
+            GraphClass = import_class(graph_class_str) # 使用您指定的 import_class
+            model_logger.info(f"成功导入图类: {graph_class_str}")
+        except ImportError as e:
+            model_logger.error(f"无法导入图类 '{graph_class_str}': {e}")
+            raise
+        except Exception as e:
+            model_logger.error(f"导入或获取图类 '{graph_class_str}' 时发生未知错误: {e}")
+            raise
+
+        self.graph_instance = GraphClass(**graph_args_cfg)
+        model_logger.info(f"图实例 '{graph_class_str}' 创建成功，参数: {graph_args_cfg}")
+
+        # 从图实例中获取邻接矩阵 A。
+        # 假设 self.graph_instance.A 返回的是一个 (K, N, N) 或 (N, N) 的 NumPy 数组或 PyTorch 张量。
+        raw_A_from_graph = self.graph_instance.A
+        if not isinstance(raw_A_from_graph, (np.ndarray, torch.Tensor)):
+            raise TypeError(f"图实例返回的 A 必须是 NumPy 数组或 PyTorch 张量，得到 {type(raw_A_from_graph)}")
+        # 将 NumPy 数组转换为 PyTorch 张量
+        if isinstance(raw_A_from_graph, np.ndarray):
+            raw_A_from_graph_tensor = torch.from_numpy(raw_A_from_graph).float()
+        else:
+            raw_A_from_graph_tensor = raw_A_from_graph.float()
+        if raw_A_from_graph_tensor.ndim == 3:
+            if raw_A_from_graph_tensor.shape[0] >= 3: # 至少包含 I, In, Out
+                # 假设索引1是In, 索引2是Out。这些索引需要与您的 graph.tools.get_spatial_graph 对应
+                adj_in = raw_A_from_graph_tensor[1]
+                adj_out = raw_A_from_graph_tensor[2]
+                # 合并内向和外向连接作为基础物理连接，并确保是布尔型
+                # (A > 0) 将非零值转为True，零值转为False
+                physical_adj_tensor_1_hop = (adj_in + adj_out) > 0
+                model_logger.info(f"  从 (K,N,N) 图邻接矩阵中提取1-hop物理连接 (合并策略索引1和2)。")
+            elif raw_A_from_graph_tensor.shape[0] == 1: # 只有一个策略，假设它就是物理连接
+                physical_adj_tensor_1_hop = raw_A_from_graph_tensor[0] > 0
+                model_logger.info(f"  使用 (1,N,N) 图邻接矩阵的第一个策略作为1-hop物理连接。")
+            else:
+                raise ValueError(f"图邻接矩阵 A 的形状 {raw_A_from_graph_tensor.shape} 不支持自动提取1-hop物理连接。")
+        elif raw_A_from_graph_tensor.ndim == 2: # (N, N)
+            physical_adj_tensor_1_hop = raw_A_from_graph_tensor > 0
+            model_logger.info(f"  使用 (N,N) 图邻接矩阵作为1-hop物理连接。")
+        else:
+            raise ValueError(f"图邻接矩阵 A 的维度 ({raw_A_from_graph_tensor.ndim}) 不支持。期望2或3维。")
+
+
         # --- 1. 基础参数 ---
-        self.num_input_dim: int = model_cfg['num_input_dim']         # 输入骨骼数据的原始特征维度
-        self.num_nodes: int = model_cfg['num_nodes']                 # 骨骼节点数
-        self.num_classes: int = model_cfg['num_classes']             # 分类任务的类别数
-        self.max_seq_len: int = model_cfg.get('max_seq_len', 100)    # 输入序列的最大长度
+        self.num_input_dim: int = model_cfg['num_input_dim']
+        self.num_nodes: int = physical_adj_tensor_1_hop.shape[0] # 从图推断节点数
+        if 'num_nodes' in model_cfg and model_cfg['num_nodes'] != self.num_nodes:
+            model_logger.warning(f"模型配置中的 num_nodes ({model_cfg['num_nodes']}) 与从图推断的节点数 ({self.num_nodes}) 不符。将使用图推断的值。")
+        self.num_classes: int = model_cfg['num_classes']
+        self.max_seq_len: int = model_cfg.get('max_seq_len', 100)
 
         # --- 2. 输入嵌入层 ---
         self.embedding_dim: int = model_cfg.get('embedding_dim', 128) # 空间处理和时间模型交互的特征维度
@@ -471,9 +558,14 @@ class SDT_BiGRU_Classifier(nn.Module):
         self.input_dropout = nn.Dropout(model_cfg.get('input_dropout_rate', 0.1))
 
         # --- 3. 逐帧空间特征提取器 (使用 SpatialAttention) ---
-        adj_matrix = self._create_local_adj_matrix( # 创建局部注意力路径所需的邻接矩阵
-            self.num_nodes, k_hop=model_cfg.get('local_adj_k_hop', 1)
+        k_hop_for_spatial_attn = model_cfg.get('local_adj_k_hop', 1)
+        # physical_adj_tensor_1_hop 是从Graph类获取的，代表纯粹的1-hop物理连接（可能不含自环）
+        adj_for_spatial_attention = self._post_process_adj_for_attention(
+            physical_adj_tensor_1_hop, # 这是(N,N)的布尔张量
+            k_hop_for_spatial_attn
         )
+        # adj_for_spatial_attention 现在是一个 (N,N) 的布尔张量，包含自环和k-hop扩展
+
         spatial_attention_cfg = { # SpatialAttention 的配置参数
             'd_model': self.embedding_dim,
             'num_nodes': self.num_nodes,
@@ -495,7 +587,7 @@ class SDT_BiGRU_Classifier(nn.Module):
             'global_use_global_spatial_bias': model_cfg.get('sa_global_use_global_spatial_bias', True),
             'fusion_type': model_cfg.get('spatial_fusion_type', 'dynamic_gate'),
             'fusion_gate_hidden_dim': model_cfg.get('spatial_fusion_gate_hidden_dim', None),
-            'adj_matrix_for_local': adj_matrix
+            'adj_matrix_for_local': adj_for_spatial_attention
         }
         self.spatial_feature_extractor = SpatialAttention(**spatial_attention_cfg)
         self.d_spatial_pooled: int = self.embedding_dim # 空间池化后的维度与embedding_dim相同
@@ -596,70 +688,52 @@ class SDT_BiGRU_Classifier(nn.Module):
         model_logger.info(f"  分类器: 输入维度={self.classifier_input_dim_final}, 隐藏层维度={self.classifier_hidden_dim}, Dropout={self.classifier_dropout_rate}")
         self.apply(self._init_weights) # 应用权重初始化
 
-    def _create_local_adj_matrix(self, num_nodes: int, k_hop: int = 1) -> torch.Tensor:
-            """
-            创建用于局部空间注意力的邻接矩阵。
-            这个矩阵是布尔型的，并且最终会包含自环和基于k-hop的连接。
-            """
-            adj_1_hop_physical = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
-            neighbor_link_for_logging = [] # 用于日志或调试，实际填充adj_1_hop_physical
+    def _post_process_adj_for_attention(self, base_adj_physical_1_hop: torch.Tensor, k_hop: int) -> torch.Tensor:
+        """
+        对基础的1-hop物理邻接矩阵进行后处理，添加自环并进行k-hop扩展。
+        Args:
+            base_adj_physical_1_hop (torch.Tensor): (N,N) 布尔张量，代表1-hop物理连接。
+                                                它应该不包含自环，或者即使包含，也会被这里的自环逻辑覆盖。
+            k_hop (int): k-hop扩展的跳数。
+        Returns:
+            torch.Tensor: (N,N) 布尔张量，处理后的最终邻接矩阵，用于空间注意力。
+        """
+        num_nodes = base_adj_physical_1_hop.shape[0]
+        device = base_adj_physical_1_hop.device # 保持设备一致性
 
-            if num_nodes == 20: # UCLA 数据集
-                model_logger.info(f"为 UCLA ({num_nodes}个节点) 创建1-hop邻接关系。")
-                neighbor_link_for_logging = [(1,2),(2,3),(4,3),(5,3),(6,5),(7,6),(8,7),(9,3),(10,9),(11,10),(12,11),(13,1),(14,13),(15,14),(16,15),(17,1),(18,17),(19,18),(20,19)]
-                for i, j in neighbor_link_for_logging:
-                    adj_1_hop_physical[i-1, j-1] = True
-                    adj_1_hop_physical[j-1, i-1] = True
-            elif num_nodes == 25: # NTU 数据集
-                model_logger.info(f"为 NTU ({num_nodes}个节点) 创建1-hop邻接关系。")
-                neighbor_link_for_logging = [(1,2),(2,21),(3,21),(4,3),(5,21),(6,5),(7,6),(8,7),(9,21),(10,9),(11,10),(12,11),(13,1),(14,13),(15,14),(16,15),(17,1),(18,17),(19,18),(20,19),(22,23),(23,8),(24,25),(25,12)]
-                for i, j in neighbor_link_for_logging:
-                    adj_1_hop_physical[i-1, j-1] = True
-                    adj_1_hop_physical[j-1, i-1] = True
-            elif num_nodes == 22: # SHREC'17 数据集
-                model_logger.info(f"为 SHREC'17 ({num_nodes}个节点) 创建1-hop邻接关系。")
-                # 你提供的 SHREC'17 图结构 (1-based index)
-                inward_ori_index = [
-                    (1, 2), (3, 1), (4, 3), (5, 4), (6, 5), (7, 2), (8, 7), (9, 8), (10, 9), (11, 2),
-                    (12, 11), (13, 12), (14, 13), (15, 2), (16, 15), (17, 16), (18, 17), (19, 2),
-                    (20, 19), (21, 20), (22, 21)
-                    # 移除了 (2,2) 自环，因为 torch.eye() 会处理所有节点的自环
-                ]
-                for i, j in inward_ori_index:
-                    # 确保节点索引在有效范围内 (1 到 num_nodes)
-                    if 1 <= i <= num_nodes and 1 <= j <= num_nodes:
-                        adj_1_hop_physical[i-1, j-1] = True # 转换为0-based索引
-                        adj_1_hop_physical[j-1, i-1] = True # 无向图
-                    else:
-                        model_logger.warning(f"SHREC'17邻接定义中出现无效节点索引: ({i}, {j})，节点数: {num_nodes}")
-            else:
-                model_logger.warning(f"未知的节点数 ({num_nodes}) 用于预定义的1-hop邻接关系。将只使用自环进行k-hop扩展（如果k_hop>0）。")
-                # adj_1_hop_physical 将保持为全零，这意味着如果没有自环，k-hop扩展也不会产生连接。
-            # 始终包含自环 (对角线为True)
-            # 注意：如果 adj_1_hop_physical 是在 GPU 上创建的，torch.eye 也应该在同一设备上
-            # 但通常邻接矩阵在CPU上创建，然后由模型模块的 register_buffer 移动到GPU
-            final_adj = torch.eye(num_nodes, dtype=torch.bool)
-            if k_hop > 0:
-                # current_reach 代表从当前 final_adj 出发，通过 adj_1_hop_physical 能到达的新节点
-                # k_hop = 1 表示只使用直接连接 (adj_1_hop_physical) 和自环
-                # k_hop = 2 表示使用1-hop的邻居的邻居，依此类推
-                # 将1-hop物理连接合并到final_adj中 (已经包含自环)
-                final_adj = final_adj | adj_1_hop_physical
+        # 确保 base_adj_physical_1_hop 是对称的 (如果是从 In+Out 合并而来，通常已经是)
+        # 并且确保它不包含自环，因为我们会在下一步显式添加
+        adj_no_self_loop = base_adj_physical_1_hop.clone()
+        if num_nodes > 0: # 只有当有节点时才操作对角线
+            adj_no_self_loop.fill_diagonal_(False) # 移除任何可能存在的自环
+        adj_no_self_loop = adj_no_self_loop | adj_no_self_loop.t() # 强制对称
 
-                # 如果 k_hop > 1，才需要进一步扩展
-                # current_adj_power_k 代表 A^k (布尔矩阵乘法)
-                # A_k_plus_1 = A_k @ A_1
-                current_adj_power_k = adj_1_hop_physical.clone() # A^1
-                for _ in range(k_hop - 1): # 如果 k_hop=1, 此循环不执行
-                    # 计算 (当前已达范围) @ (1-hop连接)
-                    # (A | A^2 | ... | A^i) @ A_1hop  -> 扩展到 A^(i+1)hop
-                    # 或者更直接：A^(k+1) = A^k @ A_1hop
-                    next_reach = torch.matmul(current_adj_power_k.float(), adj_1_hop_physical.float()) > 0
-                    final_adj = final_adj | next_reach # 合并新可达的节点
-                    current_adj_power_k = next_reach # 更新当前已达的最高跳数连接
-            
-            # model_logger.info(f"  为局部注意力创建了基于 {k_hop}-hop (包含自环和直接连接) 的邻接矩阵 (节点数={num_nodes})。")
-            return final_adj
+        # 1. 初始化 final_adj：如果 k_hop=0，则只有自环；否则，从自环和1-hop开始
+        if k_hop == 0:
+            final_adj = torch.eye(num_nodes, dtype=torch.bool, device=device)
+        else: # k_hop >= 1
+            final_adj = torch.eye(num_nodes, dtype=torch.bool, device=device) # 自环
+            final_adj = final_adj | adj_no_self_loop # 合并1-hop物理连接
+
+        # 2. 进行 k-hop 扩展 (仅当 k_hop > 1 时)
+        #    扩展基于不含自环的1-hop物理连接 (adj_no_self_loop)
+        if k_hop > 1:
+            # current_power_of_physical_adj 代表 (adj_no_self_loop)^i
+            current_power_of_physical_adj = adj_no_self_loop.clone() # 这是物理连接的1次方 (无自环)
+
+            for _hop_level in range(1, k_hop): # k_hop=2时循环1次, _hop_level=1, 计算物理连接的2次方
+                                               # k_hop=3时循环2次, _hop_level=1,2, 计算物理连接的2、3次方
+                # 计算 (物理连接的i次方) @ (物理连接的1次方) = 物理连接的(i+1)次方
+                # 这里的乘法基于不含自环的邻接矩阵，以正确模拟多跳路径
+                next_power_reach = torch.matmul(
+                    current_power_of_physical_adj.float(),
+                    adj_no_self_loop.float() # 始终乘以1-hop物理连接 (无自环)
+                ) > 0
+                final_adj = final_adj | next_power_reach    # 将新到达的连接合并到最终结果中
+                current_power_of_physical_adj = next_power_reach # 更新当前达到的最高次幂
+        
+        # model_logger.info(f"  为局部注意力创建了基于 {k_hop}-hop 的邻接矩阵 (节点数={num_nodes})。")
+        return final_adj
 
     def _init_weights(self, module: nn.Module):
         """自定义权重初始化方法。"""
@@ -690,19 +764,24 @@ class SDT_BiGRU_Classifier(nn.Module):
         """
         模型的前向传播。
 
-        参数:
-            x (torch.Tensor): 输入张量，形状 (B, T_in, N, C_in)。
-            mask (Optional[torch.Tensor]): 可选的掩码张量，形状 (B, T_in)，
-                                           True表示有效帧，False表示padding帧。
-
-        返回:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]:
-                - logits (torch.Tensor): 分类得分，形状 (B, num_classes)。
-                - output_spatial_attns (Optional[torch.Tensor]): 空间注意力权重图（如果启用），
-                                                              形状 (B, T_in, NumHeads, N, N)。
+        -- [新增] 适配新Feeder的维度重排逻辑 --
+        新Feeder返回的数据形状是 (B, C, T, V, M)，我们需要将其转换为模型内部期望的 (B, T, V, C)。
         """
+        # x 的输入形状: (B, C, T, V, M) - B:批次大小, C:坐标数(3), T:时间帧, V:关节数, M:人数
+        # 假设 M=1 的情况，我们先移除最后一个维度。
+        if x.dim() == 5:
+            # .squeeze(-1) 会移除最后一个维度，如果它是1的话
+            x = x.squeeze(-1)  # -> 形状变为 (B, C, T, V)
+        
+        # 维度重排: (B, C, T, V) -> (B, T, V, C)
+        # B: 批次, T: 时间, V: 节点, C: 通道(坐标)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        # 现在 x 的形状是 (B, T, V, C)，这正是模型后续部分所期望的输入格式。
+
+        # --- 从这里开始，后续的 forward 逻辑与您原始的代码完全相同，无需任何修改 ---
+
         B, T_in, N, C_in = x.shape
-        # model_logger.debug(f"输入形状: {x.shape}, Mask形状: {mask.shape if mask is not None else 'None'}")
+        # model_logger.debug(f"输入形状 (调整后): {x.shape}, Mask形状: {mask.shape if mask is not None else 'None'}")
 
         # 1. 输入嵌入
         x_flat = rearrange(x, 'b t n c -> (b t n) c')
@@ -725,35 +804,30 @@ class SDT_BiGRU_Classifier(nn.Module):
             x_temporal_input = x_temporal_input + time_pe
 
         # 5. 主要时间序列建模
-        # Transformer期望的key_padding_mask: (B, T), True表示对应位置是padding (需要被mask掉)
         temporal_key_padding_mask = (mask == False) if mask is not None else None
 
-        if mask is not None: # 在输入到时间模型前，将padding部分特征置零
+        if mask is not None:
             x_temporal_input = x_temporal_input * mask.unsqueeze(-1).float()
 
         if self.temporal_model_type == 'gru':
-            if hasattr(self.temporal_encoder, 'flatten_parameters'): # 解决DataParallel的潜在问题
+            if hasattr(self.temporal_encoder, 'flatten_parameters'):
                 self.temporal_encoder.flatten_parameters()
-            processed_temporal_sequence, _ = self.temporal_encoder(x_temporal_input) # (B, T, D_temporal_final_out)
+            processed_temporal_sequence, _ = self.temporal_encoder(x_temporal_input)
         elif self.temporal_model_type == 'transformer':
             processed_temporal_sequence = self.temporal_encoder(
                 x_temporal_input, src_key_padding_mask=temporal_key_padding_mask
-            ) # (B, T, D_temporal_final_out)
+            )
         else:
-            # 这种情况不应该发生，因为__init__中已经检查过了
             model_logger.error(f"前向传播中遇到未知的temporal_model_type: {self.temporal_model_type}")
             processed_temporal_sequence = x_temporal_input
 
-
         # 6. 可选的后续附加时间处理模块
-        # 注意：Provided_TA 相关的逻辑已被完全移除
-
         if self.use_multiscale_temporal_after_main and self.multiscale_temporal_processor:
             processed_temporal_sequence = self.multiscale_temporal_processor(processed_temporal_sequence, mask=mask)
 
         if self.use_temporal_attn_after_main_specific and self.temporal_attn_blocks_after_main:
             temp_out_after_main = processed_temporal_sequence
-            if mask is not None: # 再次确保padding部分为0，以正确处理LayerNorm等
+            if mask is not None:
                  temp_out_after_main = temp_out_after_main * mask.unsqueeze(-1).float()
             for block in self.temporal_attn_blocks_after_main:
                 temp_out_after_main = block(temp_out_after_main, key_padding_mask=temporal_key_padding_mask)
@@ -761,21 +835,18 @@ class SDT_BiGRU_Classifier(nn.Module):
 
         # 7. 最终序列表示聚合
         if mask is not None:
-            # 对有效时间步进行平均池化
             masked_output_for_agg = processed_temporal_sequence * mask.unsqueeze(-1).float()
-            summed_output = masked_output_for_agg.sum(dim=1) # 沿时间维度求和
-            valid_lengths = mask.sum(dim=1, keepdim=True).clamp(min=1.0) # (B, 1), 避免除以零
+            summed_output = masked_output_for_agg.sum(dim=1)
+            valid_lengths = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
             final_representation = summed_output / valid_lengths
         else:
-            # 如果没有mask，则对所有时间步进行全局平均池化
             final_representation = processed_temporal_sequence.mean(dim=1)
 
         # 8. 分类头
         logits = self.classifier(final_representation)
 
-        # 处理空间注意力图的返回 (如果需要)
+        # 处理空间注意力图的返回
         output_spatial_attns = None
-        # 检查 self.spatial_feature_extractor 是否真的有 output_attention 属性并为True
         if hasattr(self.spatial_feature_extractor, 'output_attention') and \
            self.spatial_feature_extractor.output_attention and \
            spatial_attn_weights_frames is not None:
