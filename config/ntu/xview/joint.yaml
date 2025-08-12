@@ -1,4 +1,4 @@
-work_dir: ./work_dir/ntu60/xsub/bone_motion
+work_dir: ./work_dir/ntu60/xview/joint1
 seed: 1
 device: [0]
 
@@ -6,8 +6,8 @@ device: [0]
 feeder: feeders.feeder_ntu.Feeder 
 train_feeder_args:
   # 核心路径和划分
-  data_path: 'data/ntu/NTU60_CS.npz'  
-  label_path: 'data/ntu/NTU60_CS.npz'
+  data_path: 'data/ntu/NTU60_CV.npz'  
+  label_path: 'data/ntu/NTU60_CV.npz'
   split: 'train'
   window_size: 64               
   p_interval: [0.5, 1]           
@@ -15,18 +15,18 @@ train_feeder_args:
   random_shift: false          
   random_move: false             
   random_rot: true                
-  bone: true
-  vel: true
+  bone: false
+  vel: false
 
 test_feeder_args:
   # 核心路径和划分
-  data_path: 'data/ntu/NTU60_CS.npz'  
-  label_path: 'data/ntu/NTU60_CS.npz'
+  data_path: 'data/ntu/NTU60_CV.npz'  
+  label_path: 'data/ntu/NTU60_CV.npz'
   split: 'test'  
   window_size: 64
   p_interval: [0.95]
-  vel: true
-  bone: true
+  vel: False
+  bone: false
   debug: False
 
 # --- 模型设置 ---

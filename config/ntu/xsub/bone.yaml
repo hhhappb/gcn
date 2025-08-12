@@ -1,143 +1,73 @@
-work_dir: ./work_dir/ntu60/xsub/bone # 建议为新实验或清晰的配置使用新目录
+work_dir: ./work_dir/ntu60/xsub/bone
 seed: 1
-device: [1]
+device: [0]
 
 # --- 数据设置 ---
-feeder: feeders.feeder_ntu.Feeder_NTU 
-modalities: ['bone']
-base_channel: 3
-
+feeder: feeders.feeder_ntu.Feeder 
 train_feeder_args:
   # 核心路径和划分
-  root_dir: 'data/ntu/'
-  data_path: 'NTU60_CS.npz' # 假设这是 cross-view 的数据文件
-  label_path: 'NTU60_CS.npz'
+  data_path: 'data/ntu/NTU60_CS.npz'  
+  label_path: 'data/ntu/NTU60_CS.npz'
   split: 'train'
-  # 数据基本属性
-  num_classes: 60       
-  num_nodes: 25        
-  max_len: 64            
-  window_size: 64         # 与max_len一致
-  base_channel: 3
-  p_interval: [0.5, 1.0]    # 训练时随机裁剪比例范围
-  window_size: 64           # 目标序列长度
-  random_choose: false       # 影响p_interval的使用方式
-  random_rot: true          # 启用tools.random_rot
-  bone: true               # 骨骼模态
-  motion: false            # 运动模态
-  use_relative_joint_centering: true # 对输出的joint模态使用特定中心化
-  spine_center_joint_idx: 20     # NTU中节点21的0-based索引
-  normalization: false       # 启用基于数据集的标准化 (如果get_mean_map被调用)              
+  window_size: 64               
+  p_interval: [0.5, 1]           
+  random_choose: false            
+  random_shift: false          
+  random_move: false             
+  random_rot: true                
+  bone: true
+  vel: false
 
 test_feeder_args:
   # 核心路径和划分
-  root_dir: 'data/ntu/'
-  data_path: 'NTU60_CS.npz' # 假设这是 cross-view 的数据文件
-  label_path: 'NTU60_CS.npz'
-  split: 'val'  
-  # 数据基本属性
-  num_classes: 60
-  num_nodes: 25
-  p_interval: [0.95]         # 测试时固定裁剪/缩放比例
+  data_path: 'data/ntu/NTU60_CS.npz'  
+  label_path: 'data/ntu/NTU60_CS.npz'
+  split: 'test'  
   window_size: 64
-  random_choose: false
-  random_rot: false
+  p_interval: [0.95]
+  vel: False
   bone: true
-  motion: false
-  use_relative_joint_centering: true
-  spine_center_joint_idx: 20
-  normalization: false
-
+  debug: False
 
 # --- 模型设置 ---
-model: model.SDT_GRUs_Gesture.SDT_GRU_Classifier
+model: model.sgt_net.Model
 model_args:
   # --- 基础模型配置 ---
   num_nodes: 25
-  num_classes: 60
-  max_seq_len: 64
-  # bidirectional: true # 如果模型是SDT_BiGRU_Classifier且支持此参数
+  num_class: 60
+  num_person: 2
+  dataset_name: ntu_rgb_d  # 数据集名称，用于获取预计算跳数矩阵
+  
+  # --- 图配置 ---
+  graph: graph.ntu_rgb_d.Graph
+  graph_args:
+    labeling_mode: 'spatial'
 
-  # --- GRU/RNN 相关配置 ---
-  num_rnn_layers: 1
-  num_rnn_units: 128       # 单向 GRU 的单元数
-  rnn_dropout_rate: 0.15   # GRU 层间 dropout
-  zoneout_rate: 0.15        # GRU 的 Zoneout 正则化率
+  # --- Dropout配置 ---
+  dropout_rate: 0.2
+  drop_path_rate: 0.2
 
-  # -- 参数 for 局部注意力路径 (Local Path) --
-  sa_local_st_layers: 1           # 局部路径中 EncoderLayer 的数量 (通常为1，因为是并行路径中的一个分支)
-  sa_local_n_heads: 8             # 局部注意力的头数 (256 % 16 == 0), d_k = 32. 可以尝试 4, 8
-  sa_local_ffn_dim: 256           # 局部路径FFN维度 (e.g., num_rnn_units * 2 = 192 * 2 = 384)
-  sa_local_dropout_rate: 0.1      # 局部路径的dropout
-  sa_local_qkv_bias: false
-  sa_local_use_conv_proj: true    # 局部路径是否用Conv1D投影
-  sa_local_conv_kernel_size: 5    # 局部路径Conv1D核大小 (可以小一些)
+# --- SGD优化器设置 ---
+optimizer: SGD
+base_lr: 0.1
+weight_decay: 0.0004
+nesterov: True
 
-
-  # -- 参数 for 全局注意力路径 (Global Path) --
-  sa_global_st_layers: 1          # 全局路径中 EncoderLayer 的数量
-  sa_global_n_heads: 8           # 全局注意力的头数 (192 % 12 == 0), d_k = 16
-  sa_global_ffn_dim: 256          # 全局路径FFN维度 (e.g., num_rnn_units * 2 = 384)
-  sa_global_dropout_rate: 0.15
-  sa_global_qkv_bias: false
-  sa_global_use_conv_proj: true
-  sa_global_conv_kernel_size: 9   # 全局路径Conv1D核大小 (可以大一些)
-  # -- 局部注意力邻接矩阵相关 --
-  local_adj_k_hop: 1                     # 用于创建局部邻接矩阵的跳数 (1表示直接连接)
-  local_adj_k1_includes_self_loop: true
-
-  # --- 时间处理模块配置 (v13.1 版本) ---
-  temporal_processing:
-    # -- TAInspiredModule --
-    use_ta_inspired_module: true
-    ta_inspired_mlp_hidden_ratio: 0.25
-    # -- 标准时间Transformer (TemporalTransformerBlock) --
-    use_temporal_attn: true # 是否启用标准的时间Transformer块
-    num_temporal_layers: 1  # 时间Transformer的层数
-    temporal_n_heads: 8
-    temporal_ffn_dim: 256
-    temporal_dropout_rate: 0.1
-    # -- P1.B: 分层多尺度时间处理 --
-    use_temporal_multiscale_hierarchical: true
-    num_temporal_scales: 3
-    temporal_scale_kernel_size: 3
-    temporal_scale_stride: 2
-    fusion_mlp_attn1_hidden_dim: 256 # 融合S0, S1的MLP隐藏维度
-    fusion_mlp_attn2_hidden_dim: 256 # 融合Attn1_out, S1, S2的MLP隐藏维度
-
-  # -- 融合策略与参数 --
-  spatial_fusion_type: 'dynamic_gate' # 可选: 'simple_sum_learnable_weights', 'concat_linear', 'average'
-  # 如果 fusion_type 是 'dynamic_gate', DynamicFusionGate 内部可以有自己的隐藏层维度
-  spatial_fusion_gate_hidden_dim: 48 # DynamicFusionGate 内部MLP的隐藏维度
-
-  # --- 分类头与输出配置 ---
-  classifier_hidden_dim: 96 # 分类器中间隐藏层维度 (0 表示直接线性分类)
-  classifier_dropout: 0.3   # 分类器最终 Dropout 率
-  output_attention: false   # 是否让模型 forward 方法返回注意力图
-  use_gap: true
-
-# --- 训练策略 ---
-optimizer: AdamW
-base_lr: 0.01
-weight_decay: 0.04
-warmup_lr: 1.0e-5
-
+# --- 学习率调度 ---
 lr_scheduler: multistep
-warm_up_epoch: 5
-step: [40] 
+step: [35, 55, 75]
 lr_decay_rate: 0.1
+warm_up_epoch: 5
 
-# --- 损失函数 ---
-loss_type: SmoothCE
+# --- 训练设置 ---
+num_epoch: 90
+batch_size: 64
+test_batch_size: 128
+num_worker: 12
 
-num_epoch: 65      
-batch_size: 256     # <<< 原配置256，如果显存允许可以保持，否则128或64
-test_batch_size: 256 # <<< 对应调整
-num_worker: 12      # <<< 原配置24，根据你的机器调整
-
-grad_clip: true
-grad_max: 20.0
-early_stop_patience: 0
+# --- 其他训练参数 ---
+loss_type: LSCE
+label_smoothing: 0.1
 
 # --- 日志与保存 ---
 log_interval: 0

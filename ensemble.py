@@ -29,7 +29,7 @@ def calculate_top1_accuracy(scores_tensor, labels_tensor):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="基于预测分数的后期融合，用于骨骼动作识别，并搜索最佳Top-1权重 (权重和为1)")
     parser.add_argument('--dataset', required=True, 
-                        choices={'NW-UCLA', 'ntu/xsub', 'ntu/xview', 'ntu120/xsub', 'ntu120/xset'},
+                        choices={'shrec17', 'nw-ucla', 'ntu/xsub', 'ntu/xview', 'ntu120/xsub', 'ntu120/xset'},
                         help='数据集名称，用于可能的默认行为或日志记录')
     parser.add_argument('--joint_dir', type=str, default=None, help='包含 "joint" 分数 .pkl 文件的目录')
     parser.add_argument('--bone_dir', type=str, default=None, help='包含 "bone" 分数 .pkl 文件的目录')
@@ -72,12 +72,11 @@ if __name__ == "__main__":
     label_np_array = None
     num_samples_expected_from_labels = None # 用于后续与分数文件样本数校验
 
-    if arg.label_file: # 检查用户是否提供了 --label_file 参数
+    if arg.label_file:  # 检查用户是否提供了 --label_file 参数
         if os.path.exists(arg.label_file):
             print(f"信息：检测到 --label_file 参数，将优先从 {arg.label_file} 加载标签。")
             try:
-                # 根据你的标签文件格式进行加载
-                # 示例：假设是 .pkl 文件，可以直接加载 NumPy 数组，或者包含 'label' 键的字典列表 (NW-UCLA格式)
+                # 根据文件扩展名选择加载策略
                 if arg.label_file.endswith('.pkl'):
                     with open(arg.label_file, 'rb') as f:
                         label_data_external = pickle.load(f)
@@ -86,42 +85,51 @@ if __name__ == "__main__":
                         label_np_array = label_data_external
                     elif isinstance(label_data_external, list):
                         if label_data_external and isinstance(label_data_external[0], dict) and 'label' in label_data_external[0]:
-                            # 假设是 NW-UCLA val_label.pkl 格式: list of dicts with 'label'
                             label_np_array = np.array([int(info['label']) - 1 for info in label_data_external])
-                        else: # 假设是标签列表
+                        else:
                             label_np_array = np.array(label_data_external)
-                    elif isinstance(label_data_external, dict) and 'labels' in label_data_external: # 兼容 processor.py 保存的格式
+                    elif isinstance(label_data_external, dict) and 'labels' in label_data_external:
                         label_np_array = np.array(label_data_external['labels'])
                     else:
-                        print(f"警告: 外部标签文件 {arg.label_file} 格式未知或无法解析。将尝试从分数文件加载标签。")
-                
-                # 为其他标签文件格式（如 .txt）添加加载逻辑
-                elif arg.label_file.endswith('.txt') and ('NTU' in arg.dataset or 'ntu' in arg.dataset):
-                    print(f"信息：尝试以NTU格式加载标签文件 {arg.label_file}")
-                    true_label_list = []
-                    val_txt_content = np.loadtxt(arg.label_file, dtype=str)
-                    for item_name in val_txt_content:
-                        try:
-                            # 假设标签在文件名末尾，如 S001C001P001R001A001 -> 提取 001
-                            # 你需要根据你的 NTU 标签文件名格式调整这里的提取逻辑
-                            label = int(item_name.split('A')[-1][:3]) - 1 
-                            true_label_list.append(label)
-                        except Exception as e_parse_ntu:
-                            print(f"警告: 解析NTU标签文件名 '{item_name}' 失败: {e_parse_ntu}")
-                    if true_label_list:
-                        label_np_array = np.array(true_label_list)
-                else:
-                    print(f"警告: 不支持的外部标签文件格式 {arg.label_file} 或数据集 {arg.dataset} 未配置特定加载逻辑。将尝试从分数文件加载标签。")
+                        print(f"警告: 外部.pkl标签文件 {arg.label_file} 格式未知。")
 
+                elif arg.label_file.endswith('.txt'):
+                    print(f"信息：正在加载 .txt 格式的标签文件: {arg.label_file}")
+                    try:
+                        # 方案一：尝试直接加载为纯数字标签
+                        label_np_array = np.loadtxt(arg.label_file, dtype=int)
+                        print("  文件被成功解析为纯数字标签。")
+                    except ValueError:
+                        # 方案二：如果失败，则尝试按TD-GCN样本名格式解析
+                        print(f"  直接加载为数字失败，尝试按TD-GCN样本名格式解析...")
+                        try:
+                            with open(arg.label_file, 'r') as f:
+                                sample_names = [line.strip() for line in f.readlines() if line.strip()]
+                            
+                            labels = [int(name[name.find('A') + 1:name.find('A') + 4]) - 1 for name in sample_names]
+                            
+                            if not labels:
+                                print(f"警告: 在 {arg.label_file} 中没有找到任何可以成功解析的样本名。")
+                                label_np_array = None
+                            else:
+                                label_np_array = np.array(labels)
+                                print(f"  成功从 {len(labels)} 个样本名中解析出标签。")
+                        except Exception as e_parse:
+                            print(f"警告: 按TD-GCN样本名格式解析 '{arg.label_file}' 时也失败了: {e_parse}")
+                            label_np_array = None
+                else:
+                    print(f"警告: 不支持的外部标签文件格式 {arg.label_file}。")
+
+                # 加载完成后的统一检查
                 if label_np_array is not None:
                     num_samples_expected_from_labels = len(label_np_array)
                     print(f"标签已从外部文件 {arg.label_file} 加载。样本数: {num_samples_expected_from_labels}")
-                else: # label_np_array 仍然是 None，说明外部文件加载失败或格式不对
+                else:
                     print(f"警告: 尝试从 {arg.label_file} 加载标签失败或未提取到标签。将尝试从分数文件加载。")
 
             except Exception as e_label_load:
                 print(f"从外部标签文件 {arg.label_file} 加载时发生错误: {e_label_load}。将尝试从分数文件加载标签。")
-                label_np_array = None # 确保回退
+                label_np_array = None  # 确保回退
         else:
             print(f"警告: 指定的外部标签文件 {arg.label_file} 未找到。将尝试从分数文件加载标签。")
     else:
@@ -238,14 +246,12 @@ if __name__ == "__main__":
     if final_evaluation_alphas is None:
         alphas_cmd = arg.alphas
         if alphas_cmd is not None:
-            if len(alphas_cmd) != num_active_streams: print(f"错误: 命令行 alphas 数量与激活流数量不匹配。"); sys.exit(1)
-            if abs(sum(alphas_cmd) - 1.0) > 1e-5 and sum(alphas_cmd) > 0 : # 检查和是否为1，如果不是则归一化
-                print(f"警告：命令行提供的alphas总和 ({sum(alphas_cmd):.3f}) 不为1，将进行归一化。")
-                alphas_cmd = [a / sum(alphas_cmd) for a in alphas_cmd]
+            if len(alphas_cmd) != num_active_streams: print(f"错误: 命令行 alphas 数量 ({len(alphas_cmd)}) 与激活流数量 ({num_active_streams}) 不匹配。"); sys.exit(1)
+            print(f"信息：将直接使用用户指定的权重，总和为 {sum(alphas_cmd):.4f}，不进行归一化。")
             final_evaluation_alphas = alphas_cmd
         else:
             print("信息：未通过 --alphas 提供权重，且未搜索（或无结果）。使用预设/平均权重。")
-            if 'UCLA' in arg.dataset:
+            if 'ucla' in arg.dataset:
                 if num_active_streams == 4: final_evaluation_alphas = [0.6, 0.6, 0.4, 0.4]; final_evaluation_alphas = [a/sum(final_evaluation_alphas) for a in final_evaluation_alphas] # 确保和为1
                 elif num_active_streams == 2 and all(s in active_stream_names for s in ['joint', 'bone']): final_evaluation_alphas = [0.6,0.4]
                 elif num_active_streams == 1: final_evaluation_alphas = [1.0]
@@ -264,3 +270,34 @@ if __name__ == "__main__":
     weights_to_print = best_alphas_for_top1 if arg.find_best_alphas and best_alphas_for_top1 is not None else final_evaluation_alphas
     print(f"使用的权重: {[round(a, 4) for a in weights_to_print]} (总和: {sum(weights_to_print):.4f})") # 确保打印和为1
     print(f'最佳 Top1 Acc: {best_top1_acc * 100:.2f}%')
+
+
+
+    # python ensemble.py \
+    # --dataset shrec17 \
+    # --label_file ensemble/shrec17_14.txt \
+    # --joint_dir ./work_dir/shrec17/14joint \
+    # --bone_dir ./work_dir/shrec17/14bone \
+    # --joint_motion_dir ./work_dir/shrec17/14joint_motion \
+    # --find_best_alphas \
+    # --alpha_search_granularity 40
+
+    # python ensemble.py \
+    # --dataset nw-ucla \
+    # --label_file data/nw-ucla/val_label.pkl \
+    # --joint_dir ./work_dir/nw-ucla/joint \
+    # --bone_dir ./work_dir/nw-ucla/bone \
+    # --joint_motion_dir ./work_dir/nw-ucla/joint_motion \
+    # --bone_motion_dir ./work_dir/nw-ucla/bone_motion \
+    # --find_best_alphas \
+    # --alpha_search_granularity 40
+
+    # python ensemble.py \
+    # --dataset ntu/xsub \
+    # --label_file ./ensemble/NTU60_XSub_Val.txt \
+    # --joint_dir ./work_dir/ntu60/xsub/joint \
+    # --bone_dir ./work_dir/ntu60/xsub/bone \
+    # --joint_motion_dir ./work_dir/ntu60/xsub/joint_motion \
+    # --bone_motion_dir ./work_dir/ntu60/xsub/bone_motion \
+    # --find_best_alphas \
+    # --alpha_search_granularity 20

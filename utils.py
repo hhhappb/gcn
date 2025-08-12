@@ -1,4 +1,4 @@
-# 文件名: utils.py (修正 init_seed 日志行为)
+# 文件名: utils.py (8.3)
 import torch
 import numpy as np
 import random
@@ -35,29 +35,18 @@ def get_logger(log_dir, name='default_log', level=logging.INFO, print_to_console
         logger.propagate = False
     return logger
 
-# --- 随机种子初始化 ---
-def init_seed(seed, source_description="全局"): # 新增 source_description
-    """
-    初始化各种库的随机种子，以确保实验的可复现性。
-    Args:
-        seed (int): 要设置的随机种子。
-        source_description (str): 描述调用来源，用于日志。
-    """
-    if seed is None:
-        logger_utils.info(f"[{source_description}] 随机种子未设置 (seed is None)。")
-        return
-
+def init_seed(seed):
+    torch.cuda.manual_seed_all(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed) # 只在 CUDA 可用时调用
     np.random.seed(seed)
     random.seed(seed)
-
-    # 为了可复现性
+    # torch.backends.cudnn.enabled = True
+    # training speed is too slow if set to True
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False # benchmark 为 False 可能影响性能，但对复现性更好
 
-    logger_utils.info(f"[{source_description}] 所有库的随机种子已设置为: {seed}")
+    # on cuda 11 cudnn8, the default algorithm is very slow
+    # unlike on cuda 10, the default works well
+    torch.backends.cudnn.benchmark = False
 
 # --- 动态类导入 ---
 def import_class(import_str):
@@ -149,25 +138,18 @@ class DictAction(argparse.Action):
                 ) from e_kv
         setattr(namespace, self.dest, parsed_dict)
 
-# --- 自定义标签平滑交叉熵损失 ---
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, smoothing=0.1):
         super(LabelSmoothingCrossEntropy, self).__init__()
-        if not (0.0 <= smoothing < 1.0):
-             raise ValueError(f"smoothing 值 ({smoothing}) 必须在 [0, 1) 范围内")
         self.smoothing = smoothing
-        self.confidence = 1.0 - smoothing
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if x.size(0) != target.size(0):
-            raise ValueError(f"输入和目标样本数不匹配: x ({x.size(0)}), target ({target.size(0)})")
-        if x.dim() != 2 or target.dim() != 1:
-            raise ValueError(f"输入维度应为2 (N,C)，目标维度应为1 (N)。得到: x {x.dim()}, target {target.dim()}")
+    def forward(self, x, target):
+        confidence = 1. - self.smoothing
         logprobs = F.log_softmax(x, dim=-1)
         nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
         nll_loss = nll_loss.squeeze(1)
         smooth_loss = -logprobs.mean(dim=-1)
-        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        loss = confidence * nll_loss + self.smoothing * smooth_loss
         return loss.mean()
 
 # --- 自定义 Collate 函数 ---

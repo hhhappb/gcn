@@ -1,0 +1,74 @@
+work_dir: ./work_dir/shrec17/28joint_motion
+phase: train
+seed: 1
+device: 0
+
+# --- 数据设置 ---
+feeder: feeders.feeder_shrec17.Feeder
+train_feeder_args:
+  data_path: joint_motion  # 模态 joint, bone, joint motion
+  label_path: train # 训练
+  debug: false
+  random_choose: false
+  random_shift: false
+  random_move: false
+  window_size: 180 # max:180
+  normalization: false
+  repeat: 5 # 重复
+  label_flag: 28 # 14 or 28
+
+test_feeder_args:
+  data_path: joint_motion # 模态
+  label_path: val # 验证
+  debug: false
+  label_flag: 28 # 14 or 28
+  random_choose: false
+
+# --- 模型设置 (适配 sgt_net.py) ---
+model: model.sgt_net.Model
+model_args:
+  # --- 基础配置 ---
+  num_input_dim: 3  # xyz坐标
+  num_nodes: 22     # SHREC17数据集的关节点数
+  num_class: 28     # SHREC17手势类别数 
+  num_person: 1     # 单人数据
+  dataset_name: shrec17  # 数据集名称，用于获取预计算跳数矩阵
+
+  graph: graph.shrec17.Graph
+  graph_args:
+    labeling_mode: spatial
+
+  # --- Dropout配置 ---
+  dropout_rate: 0.1
+  drop_path_rate: 0.15
+
+# --- SGD优化器设置 ---
+optimizer: SGD
+base_lr: 0.1
+weight_decay: 0.0001
+nesterov: True
+
+# --- 学习率调度 ---
+lr_scheduler: multistep
+step: [70, 100]
+lr_decay_rate: 0.1
+warm_up_epoch: 20
+
+# --- 训练设置 ---
+num_epoch: 120
+batch_size: 64
+test_batch_size: 64
+num_worker: 12
+
+# --- 其他训练参数 ---
+loss_type: LSCE
+label_smoothing: 0.1
+
+# --- 日志与保存 ---
+log_interval: 0
+eval_interval: 1
+save_interval: 0
+save_epoch: 0
+print_log: true
+save_score: true
+show_topk: [1]
