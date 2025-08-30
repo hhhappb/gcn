@@ -106,8 +106,7 @@ class EncoderLayer(nn.Module):
     
     def __init__(self, d_model, n_heads, dropout_rate=0.0, drop_path_rate=0.0, hop_matrix=None):
         super().__init__()
-        # 使用与GCN流一致的BN：对 [N, C, V] 形状做 BN1d(C)
-        self.norm1 = nn.BatchNorm1d(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
         self.attn = AttentionLayer(
             d_model=d_model, 
             n_heads=n_heads, 
@@ -117,10 +116,9 @@ class EncoderLayer(nn.Module):
         self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
     def forward(self, x):
-        # BN前后维度转换: [N, V, C] -> [N, C, V] -> BN -> [N, V, C]
+        # Pre-LN架构
         shortcut1 = x
-        x_bn_in = x.permute(0, 2, 1)
-        x_norm1 = self.norm1(x_bn_in).permute(0, 2, 1)
+        x_norm1 = self.norm1(x)
         attn_output, attn_weights = self.attn(x_norm1)
         x = shortcut1 + self.drop_path1(attn_output)
         return x, attn_weights

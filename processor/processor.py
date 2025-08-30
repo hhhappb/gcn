@@ -16,7 +16,6 @@ import time
 import shutil
 import inspect
 import pickle
-import csv 
 import traceback
 import random
 from collections import OrderedDict
@@ -26,7 +25,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 current_file_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_file_dir)
 if project_root not in sys.path: sys.path.insert(0, project_root)
-from utils import init_seed, import_class, collate_fn_filter_none, LabelSmoothingCrossEntropy 
+from utils import init_seed, import_class, LabelSmoothingCrossEntropy 
 from timm.scheduler.cosine_lr import CosineLRScheduler
 
 class Processor():
@@ -134,12 +133,20 @@ class Processor():
 
     def _save_config(self):
         try:
-            # 直接保存所有参数，简单明了
-            config_to_save = vars(self.arg)
+            # 只保存YAML中实际设置的参数，避免保存大量默认参数
+            config_to_save = {
+                'work_dir': self.arg.work_dir,
+                'phase': self.arg.phase,
+                'device': getattr(self.arg, 'device', None),
+                'command_line': ' '.join(sys.argv)
+            }
             
-            # 移除一些不需要保存的内部状态
-            config_to_save.pop('_yaml_set_params', None)
-
+            # 只保存YAML中实际设置的参数
+            if hasattr(self.arg, '_yaml_set_params') and self.arg._yaml_set_params:
+                for param in self.arg._yaml_set_params:
+                    if hasattr(self.arg, param):
+                        config_to_save[param] = getattr(self.arg, param)
+            
             filepath = os.path.join(self.arg.work_dir, 'config_used.yaml')
             with open(filepath, 'w', encoding='utf-8') as f:
                 # 写入文件头信息
@@ -147,13 +154,13 @@ class Processor():
                 f.write(f"# Phase: {self.arg.phase}\n")
                 f.write(f"# Device: {self.output_device}\n")
                 f.write(f"# Command line: {' '.join(sys.argv)}\n")
-                f.write(f"# 本文件包含本次运行的所有参数（包括默认值）\n\n")
+                f.write(f"# 本文件只包含YAML配置文件中实际设置的参数\n\n")
                 
-                # 直接dump所有参数，无需复杂排序
+                # 保存简化的配置
                 yaml.dump(config_to_save, f, default_flow_style=False, 
                         sort_keys=True, Dumper=Dumper, allow_unicode=True)
             
-            self.print_log(f"完整配置已保存到: {filepath}")
+            self.print_log(f"简化配置已保存到: {filepath}")
             
         except Exception as e:
             self.print_log(f"警告: 保存 config_used.yaml 失败: {e}", logging.WARNING)
@@ -164,7 +171,7 @@ class Processor():
         if not self.arg.feeder: raise ValueError("'feeder' 参数未设置。")
         Feeder = import_class(self.arg.feeder)
         feeder_constructor_args = feeder_args.copy()
-        feeder_constructor_args.pop('max_len', None)       # 安全地移除'max_len'
+        feeder_constructor_args.pop('max_len', None)      
         
         # 使用清理过的参数来实例化数据集
         dataset = Feeder(**feeder_constructor_args)
@@ -175,7 +182,7 @@ class Processor():
             num_workers=num_worker,
             drop_last=getattr(self.arg, 'drop_last', True) if is_train else False,
             worker_init_fn=init_seed,
-            pin_memory=True, collate_fn=collate_fn_filter_none
+            pin_memory=True
         )
         log_modality_info = feeder_args.get('data_path', '未知数据路径')
         self.print_log(f"{'训练' if is_train else '验证/测试'}数据加载器 '{os.path.basename(self.arg.feeder)}' "
@@ -291,35 +298,26 @@ class Processor():
         self.scheduler = None
         self.lr_scheduler_each_step = None
 
-    def _adjust_learning_rate_for_warmup(self, epoch): # 保持原名，实现手动warmup和decay
-        """手动调整学习率，包括预热和基于step的衰减。在每个训练epoch开始时调用。"""
-        base_lr = self.arg.base_lr
-        warmup_epochs = getattr(self.arg, 'warm_up_epoch', 0)
-        calculated_lr = base_lr
-
-        if epoch < warmup_epochs:
-            warmup_lr_init = getattr(self.arg, 'warmup_lr', 1e-6)
-            if warmup_epochs > 0: # 避免除以零
-                calculated_lr = warmup_lr_init + (base_lr - warmup_lr_init) * (epoch + 1) / warmup_epochs
-        else:
-            # MultiStep 衰减逻辑
-            decay_steps = getattr(self.arg, 'step', [])
-            num_decays = np.sum(epoch >= np.array(decay_steps)) # 假设step是0-based epoch索引
-            calculated_lr = base_lr * (getattr(self.arg, 'lr_decay_rate', 0.1) ** num_decays)
-
-        # 应用计算出的学习率
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = calculated_lr
-        
-        self.lr = calculated_lr # 更新 self.lr 属性
-        return calculated_lr
+    def adjust_learning_rate(self, epoch): 
+        if self.arg.optimizer == 'SGD' or self.arg.optimizer == 'Adam' :
+            if epoch < self.arg.warm_up_epoch: 
+                lr = self.arg.base_lr * (epoch + 1) / self.arg.warm_up_epoch 
+            else: 
+                lr = self.arg.base_lr * ( 
+                        self.arg.lr_decay_rate ** np.sum(epoch >= np.array(self.arg.step))) 
+            for param_group in self.optimizer.param_groups: 
+                param_group['lr'] = lr 
+            self.lr = lr
+            return lr 
+        else: 
+            raise ValueError()
 
     def record_time(self): self.cur_time = time.time()
     def split_time(self): split = time.time() - self.cur_time; self.record_time(); return split
 
     def train(self, epoch):
         self.model.train()
-        current_lr = self._adjust_learning_rate_for_warmup(epoch)
+        current_lr = self.adjust_learning_rate(epoch)
         
         # --- 日志与进度条设置 ---
         log_prefix = f'Epoch {epoch + 1}/{self.arg.num_epoch}'
@@ -335,14 +333,12 @@ class Processor():
         # --- 用于累积指标的变量 ---
         total_loss = 0.0
         total_correct = 0
-        total_samples = 0
-        grad_norm_values = [] 
+        total_samples = 0 
 
         process = tqdm(loader, desc=log_prefix, ncols=120, leave=False)
 
         # --- 标准的全精度训练循环 ---
         for batch_data in process:
-            if batch_data is None: continue
             
             # 1. 数据准备
             data, label, index = batch_data
@@ -365,18 +361,8 @@ class Processor():
             self.optimizer.zero_grad()
             loss.backward()
 
-            # 4. 梯度裁剪与范数计算 (简化)
-            if getattr(self.arg, 'grad_clip', True):
-                # clip_grad_norm_ 会返回裁剪前的总范数
-                total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.arg.grad_max)
-            else:
-                # 如果不裁剪，我们依然可以计算一下范数用于日志
-                total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) for p in self.model.parameters() if p.grad is not None]), 2)
+            # 4. 权重更新（已移除梯度裁剪）
 
-            if torch.isfinite(total_norm):
-                grad_norm_values.append(total_norm.item())
-
-            # 5. 权重更新
             self.optimizer.step()
             
             # 6. 累积指标
@@ -388,11 +374,9 @@ class Processor():
             
             # 7. 更新tqdm进度条
             if total_samples > 0:
-                grad_str = f"{total_norm.item():.2f}" if torch.isfinite(total_norm) else "NaN"
                 process.set_postfix_str(
                     f"Loss: {loss.item():.3f}, "
-                    f"Acc: {(pred == label).float().mean().item():.3f}, "
-                    f"Grad: {grad_str}"
+                    f"Acc: {(pred == label).float().mean().item():.3f}"
                 )
 
         process.close()
@@ -400,16 +384,14 @@ class Processor():
         # --- Epoch结束后的总结与日志 ---
         avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
         avg_acc = total_correct / total_samples * 100.0 if total_samples > 0 else 0.0
-        avg_grad_norm = np.mean(grad_norm_values) if grad_norm_values else 0.0
         
-        self.print_log(f'\t平均训练损失: {avg_loss:.4f}. 平均训练准确率: {avg_acc:.2f}%. 平均梯度范数: {avg_grad_norm:.4f}')
+        self.print_log(f'\t平均训练损失: {avg_loss:.4f}. 平均训练准确率: {avg_acc:.2f}%.')
 
         if self.train_writer:
             self.train_writer.add_scalar('Epoch训练/平均损失', avg_loss, epoch + 1)
             self.train_writer.add_scalar('Epoch训练/平均准确率', avg_acc / 100.0, epoch + 1)
-            self.train_writer.add_scalar('Epoch训练/平均梯度范数', avg_grad_norm, epoch + 1)
             self.train_writer.add_scalar('学习率/Epoch', current_lr, epoch + 1)
-    def eval(self, epoch, save_score_final_eval=False, loader_name=['val'], wrong_file=None, result_file=None, use_gcn=None, use_transformer=None):      
+    def eval(self, epoch, save_score_final_eval=False, loader_name=['val'], wrong_file=None, result_file=None):      
             self.model.eval()
             self.print_log(f'======> 评估 Epoch: {epoch + 1} 于数据集: {", ".join(loader_name)}')
             final_eval_acc = 0.0
@@ -426,7 +408,6 @@ class Processor():
                 process = tqdm(loader, desc=f"评估 {ln} (Epoch {epoch+1})", ncols=120, leave=False)
 
                 for batch_data in process:
-                    if batch_data is None: continue
                     
                     data, label_cpu, index = batch_data
                     data = data.float().to(self.output_device, non_blocking=True)
@@ -434,10 +415,7 @@ class Processor():
                     
                     with torch.no_grad():
                         try:
-                            if use_gcn is None and use_transformer is None:
-                                model_output = self.model(data)
-                            else:
-                                model_output = self.model(data, use_gcn=use_gcn, use_transformer=use_transformer)
+                            model_output = self.model(data)
                             output = model_output[0] if isinstance(model_output, tuple) else model_output
                             loss = self.loss(output, label_gpu)
                             if not (torch.isnan(loss) or torch.isinf(loss)): all_loss.append(loss.item())
@@ -538,9 +516,7 @@ class Processor():
                         val_acc, _ = self.eval(
                             epoch,
                             save_score_final_eval=False,
-                            loader_name=['val'],
-                            use_gcn=getattr(self.arg, 'eval_use_gcn', None),
-                            use_transformer=getattr(self.arg, 'eval_use_transformer', None)
+                            loader_name=['val']
                         )
                         
                         if val_acc > self.best_acc:
@@ -573,9 +549,7 @@ class Processor():
                     _, final_score_path_for_main = self.eval(
                         epoch=best_epoch - 1, # 传递正确的epoch号给报告
                         save_score_final_eval=True, 
-                        loader_name=final_loader,
-                        use_gcn=getattr(self.arg, 'eval_use_gcn', None),
-                        use_transformer=getattr(self.arg, 'eval_use_transformer', None)
+                        loader_name=final_loader
                     )
                 else:
                     self.print_log(f"警告: 找不到最佳模型的权重文件: {best_weights_path}", logging.WARNING)
@@ -597,9 +571,7 @@ class Processor():
                 _, final_score_path_for_main = self.eval(
                     epoch=0,
                     save_score_final_eval=True,
-                    loader_name=['test'],
-                    use_gcn=getattr(self.arg, 'eval_use_gcn', None),
-                    use_transformer=getattr(self.arg, 'eval_use_transformer', None)
+                    loader_name=['test']
                 )
                 self.print_log(f'测试完成。')
 

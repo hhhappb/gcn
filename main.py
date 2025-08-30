@@ -26,13 +26,9 @@ def get_parser():
     # === 基础配置参数 ===
     parser.add_argument('--work-dir', default='./work_dir/default_run', help='主工作目录')
     parser.add_argument('--config', default=None, help='YAML 配置文件的路径') # 例如: config/ucla/my_experiment.yaml
-    parser.add_argument('--phase', default='train', 
-                   choices=['train', 'test', 'model_size'], 
-                   help='运行阶段 (train, test, model_size)')
-    parser.add_argument('--label-file', type=str, default=None, help='测试集真实标签文件路径 (主要用于最终评估)') # 例如: data/ucla/val_label.pkl
+    parser.add_argument('--phase', default='train',choices=['train', 'test', 'model_size'], help='运行阶段 (train, test, model_size)')
     parser.add_argument('--device', type=int, default=None, nargs='+', help='GPU 索引列表 (例如: 0 1, 或 -1 代表CPU)')
     parser.add_argument('--seed', type=int, default=1, help='随机种子')
-    
     # === 数据相关参数 ===
     parser.add_argument('--feeder', default=None, help='数据加载器类的导入路径')
     parser.add_argument('--train-feeder-args', action=DictAction, default={}, help='训练数据加载器参数')
@@ -40,13 +36,10 @@ def get_parser():
     parser.add_argument('--num-worker', type=int, default=4, help='DataLoader 工作进程数')
     parser.add_argument('--batch-size', type=int, default=None, help='训练批次大小')
     parser.add_argument('--test-batch-size', type=int, default=None, help='测试批次大小')
-    
     # === 模型相关参数 ===
     parser.add_argument('--model', default=None, help='模型类的导入路径')
     parser.add_argument('--model-args', action=DictAction, default={}, help='模型初始化参数')
     parser.add_argument('--weights', default=None, help='预训练权重路径')
-    parser.add_argument('--ignore-weights', type=str, default=[], nargs='+', help='加载权重时要忽略的层名关键字')
-    
     # === 训练相关参数 ===
     parser.add_argument('--optimizer', default='SGD', choices=['SGD', 'AdamW'], help='优化器类型')
     parser.add_argument('--base-lr', type=float, default=0.01, help='初始学习率')
@@ -56,12 +49,10 @@ def get_parser():
     parser.add_argument('--num-epoch', type=int, default=80, help='总训练轮数')
     parser.add_argument('--loss-type', type=str, default='LSCE', choices=['CE', 'LSCE'], help='损失函数类型')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='标签平滑系数')
-    
     # === 学习率调度参数 ===
     parser.add_argument('--step', type=int, default=[60, 75], nargs='+', help='学习率衰减轮次节点')
     parser.add_argument('--lr-decay-rate', type=float, default=0.1, help='学习率衰减率')
     parser.add_argument('--warm_up_epoch', type=int, default=5, help='学习率预热轮数')
-    parser.add_argument('--warmup_lr', type=float, default=1.0e-5, help='预热阶段起始学习率')
     
     # === 训练控制参数 ===
     parser.add_argument('--eval-interval', type=int, default=1, help='每隔多少轮进行一次评估')
@@ -72,11 +63,7 @@ def get_parser():
     parser.add_argument('--print-log', type=str2bool, default=True, help='是否打印日志到控制台和文件')
     parser.add_argument('--save-score', type=str2bool, default=True, help='测试或评估时是否保存预测分数')
     parser.add_argument('--show-topk', type=int, default=[1], nargs='+', help='评估时显示 Top-K 准确率')
-    parser.add_argument('--grad_clip', type=str2bool, default=True,help='是否启用梯度裁剪')
-    parser.add_argument('--grad_max',type=float,default=10.0,help='梯度裁剪的最大范数 (如果 grad_clip 为 True)')
-    parser.add_argument('--use-amp', action=argparse.BooleanOptionalAction, default=None, help='开启AMP (--use-amp) 或 关闭AMP (--no-use-amp)')
-    parser.add_argument('--graph', type=str, default=None, help='The graph definition class, e.g., "graph.ntu_rgb_d.Graph"')
-    parser.add_argument('--graph_args', action=DictAction, default=dict(), help='The arguments for the graph constructor')
+
     return parser
 
 if __name__ == '__main__':
